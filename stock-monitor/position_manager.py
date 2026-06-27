@@ -7,7 +7,13 @@ import os
 from datetime import date
 from typing import Dict, Any, Optional, Tuple
 
-from state_manager import get_data_path, EXECUTION_LOG_MAX, trade_execution_timestamp, load_config
+from state_manager import (
+    get_data_path,
+    EXECUTION_LOG_MAX,
+    trade_execution_timestamp,
+    load_config,
+    parse_momentum_ticker_entry,
+)
 from position_state import (
     load_position_state,
     save_position_state_atomic,
@@ -21,7 +27,7 @@ def process_trade(
     trade_type: str,
     ticker: str,
     price: float,
-    quantity: int = 1,
+    quantity: float = 1,
     trade_date: Optional[date] = None
 ) -> Tuple[bool, str]:
     """
@@ -31,7 +37,7 @@ def process_trade(
         trade_type: 操作类型，"买入" 或 "卖出"
         ticker: 标的代码
         price: 交易价格
-        quantity: 数量（买入时需要）
+        quantity: 数量（买入/卖出都会写入状态文件）
         trade_date: 交易日期，默认为今天
     
     Returns:
@@ -39,6 +45,7 @@ def process_trade(
     """
     if not ticker or price <= 0:
         return False, "请填写完整信息"
+    ticker = _configured_momentum_ticker_for(ticker)
     
     if trade_date is None:
         trade_date = date.today()
@@ -63,8 +70,34 @@ def process_trade(
     else:  # 卖出
         return _handle_sell(
             state, current_positions, history, execution_logs, state_path,
-            ticker, price, trade_date
+            ticker, price, quantity, trade_date
         )
+
+
+def _configured_momentum_ticker_for(ticker: str) -> str:
+    """把展示/旧 ticker 规范化为配置中的行情 ticker，例如 VUAA -> VUAA.L。"""
+    ticker_u = str(ticker or "").strip().upper()
+    if not ticker_u:
+        return ""
+
+    try:
+        config = load_config()
+    except Exception:
+        return ticker_u
+
+    configured = {
+        parsed.get("ticker")
+        for parsed in (parse_momentum_ticker_entry(t) for t in config.get("tickers", []))
+        if parsed.get("ticker")
+    }
+    if ticker_u in configured:
+        return ticker_u
+
+    for cfg_ticker in configured:
+        if "." in cfg_ticker and cfg_ticker.split(".", 1)[0] == ticker_u:
+            return cfg_ticker
+
+    return ticker_u
 
 
 def _handle_buy(
@@ -75,7 +108,7 @@ def _handle_buy(
     state_path: str,
     ticker: str,
     price: float,
-    quantity: int,
+    quantity: float,
     trade_date: date
 ) -> Tuple[bool, str]:
     """处理买入操作"""
@@ -92,11 +125,11 @@ def _handle_buy(
         new_positions = [p for p in current_positions if p.get("ticker") != ticker]
         new_positions.append({
             "ticker": ticker,
-            "buy_price": round(avg_price, 2),
+            "buy_price": round(avg_price, 4),
             "buy_date": existing_positions[0]["buy_date"],  # 保留最早买入日期
             "quantity": total_quantity,
             "buy_reason": "手动买入(合并)",
-            "peak_high_t": round(avg_price, 2),
+            "peak_high_t": round(avg_price, 4),
         })
         state["current_positions"] = new_positions
         message = f"✅ 已记录买入 {ticker} @ {price:.2f} * {quantity}股（已合并持仓，平均成本：{avg_price:.2f}）"
@@ -117,7 +150,7 @@ def _handle_buy(
     timestamp = trade_execution_timestamp(trade_date, "买入")
     execution_logs.append({
         "timestamp": timestamp,
-        "log": f"手动买入 {ticker} @ {price:.2f} * {quantity}股"
+        "log": f"手动买入 {ticker} @ {price:.2f}"
     })
     state["execution_logs"] = execution_logs[-EXECUTION_LOG_MAX:]
     
@@ -136,6 +169,7 @@ def _handle_sell(
     state_path: str,
     ticker: str,
     price: float,
+    quantity: float,
     trade_date: date
 ) -> Tuple[bool, str]:
     """处理卖出操作"""
@@ -149,6 +183,13 @@ def _handle_sell(
     if not position_to_sell:
         return False, f"❌ 未找到 {ticker} 的持仓"
     
+    position_quantity = float(position_to_sell.get("quantity", 1))
+    sell_quantity = float(quantity or position_quantity)
+    if sell_quantity <= 0:
+        return False, "卖出数量必须大于 0"
+    if sell_quantity > position_quantity:
+        return False, f"❌ {ticker} 持仓数量不足（当前 {position_quantity:g}，卖出 {sell_quantity:g}）"
+
     # 计算收益
     buy_price = position_to_sell["buy_price"]
     buy_date_str = position_to_sell["buy_date"]
@@ -169,14 +210,23 @@ def _handle_sell(
         "sell_price": price,
         "sell_date": trade_date.isoformat(),
         "sell_reason": "手动卖出",
+        "quantity": sell_quantity,
         "total_return": round(total_return, 4),
         "hold_days": hold_days
     })
     state["history"] = history[-100:]
     
-    # 移除持仓
-    current_positions = [p for p in current_positions if p.get("ticker") != ticker]
-    state["current_positions"] = current_positions
+    # 更新持仓：部分卖出保留原平均成本，全部卖出移除持仓
+    remaining_quantity = position_quantity - sell_quantity
+    if remaining_quantity > 1e-9:
+        for p in current_positions:
+            if p.get("ticker") == ticker:
+                p["quantity"] = round(remaining_quantity, 6)
+                break
+        state["current_positions"] = current_positions
+    else:
+        current_positions = [p for p in current_positions if p.get("ticker") != ticker]
+        state["current_positions"] = current_positions
     
     # 添加执行日志
     timestamp = trade_execution_timestamp(trade_date, "卖出")
@@ -188,33 +238,19 @@ def _handle_sell(
     
     # 保存状态文件
     _save_state(state, state_path)
-    sync_position_state_on_trade(ticker, "卖出", price, trade_date)
+    if remaining_quantity <= 1e-9:
+        sync_position_state_on_trade(ticker, "卖出", price, trade_date)
     
     return True, f"✅ 已记录卖出 {ticker} @ {price:.2f}, 收益：{total_return*100:.2f}%"
 
 
 def _resolve_position_state_targets(ticker: str, config: Dict[str, Any]) -> list:
-    """匹配疯牛 / 美股大盘配置，返回 (state_key, benchmark, market) 列表。"""
-    from strategy import parse_madbulls_config, parse_market_configs, _infer_madbull_market
+    """匹配美股大盘配置，返回 (state_key, benchmark, market) 列表。"""
+    from strategy import parse_market_configs
 
     t = ticker.strip().upper()
     hits = []
     seen = set()
-
-    for mc in parse_madbulls_config(config.get("madbulls", "")):
-        state_key = mc["ticker"]
-        candidates = {
-            state_key,
-            mc.get("real_ticker", "").upper(),
-            mc.get("benchmark", "").upper(),
-        }
-        if t not in candidates:
-            continue
-        if state_key in seen:
-            continue
-        seen.add(state_key)
-        market = _infer_madbull_market(mc["real_ticker"], config)
-        hits.append((state_key, mc.get("benchmark", mc["real_ticker"]), market))
 
     for mc in parse_market_configs(config.get("us_stocks", "")):
         state_key = mc["buy_ticker"]
@@ -232,7 +268,7 @@ def sync_position_state_on_trade(
     price: float,
     trade_date: date,
 ) -> None:
-    """调仓时同步 position_state（疯牛 / 美股大盘）。"""
+    """调仓时同步 position_state（美股大盘）。"""
     try:
         config = load_config()
         targets = _resolve_position_state_targets(ticker, config)

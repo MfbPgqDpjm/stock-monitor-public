@@ -232,15 +232,16 @@ def notify_momentum_positions(bark_key: str, positions: List[Dict], scan_time: O
             ticker = p.get("ticker", "")
             sell_reason = p.get("sell_reason", "未知")
             latest_price = p.get("latest_price")
-            ema50 = p.get("ema50")
+            trend_indicator = p.get("trend_indicator") or "EMA50"
+            trend_ema = p.get("trend_ema", p.get("ema100", p.get("ema50")))
             total_return = p.get("total_return", 0)
             if isinstance(total_return, (int, float)):
                 return_str = f"{total_return * 100:.2f}%"
             else:
                 return_str = "N/A"
             price_str = f"${latest_price:.2f}" if isinstance(latest_price, (int, float)) else "N/A"
-            ema50_str = f"EMA50：${ema50:.2f}" if isinstance(ema50, (int, float)) else "EMA50：N/A"
-            body_lines.append(f"  {ticker} | {sell_reason} | {price_str} | {ema50_str} | 收益：{return_str}")
+            trend_ema_str = f"{trend_indicator}：${trend_ema:.2f}" if isinstance(trend_ema, (int, float)) else f"{trend_indicator}：N/A"
+            body_lines.append(f"  {ticker} | {sell_reason} | {price_str} | {trend_ema_str} | 收益：{return_str}")
     
     # 再推送持有持仓
     if hold_positions:
@@ -249,7 +250,8 @@ def notify_momentum_positions(bark_key: str, positions: List[Dict], scan_time: O
         for p in hold_positions:
             ticker = p.get("ticker", "")
             latest_price = p.get("latest_price")
-            ema50 = p.get("ema50")
+            trend_indicator = p.get("trend_indicator") or "EMA50"
+            trend_ema = p.get("trend_ema", p.get("ema100", p.get("ema50")))
             total_return = p.get("total_return", 0)
             max_drawdown = p.get("max_drawdown", 0)
             if isinstance(total_return, (int, float)):
@@ -261,8 +263,8 @@ def notify_momentum_positions(bark_key: str, positions: List[Dict], scan_time: O
             else:
                 drawdown_str = "N/A"
             price_str = f"${latest_price:.2f}" if isinstance(latest_price, (int, float)) else "N/A"
-            ema50_str = f"EMA50：${ema50:.2f}" if isinstance(ema50, (int, float)) else "EMA50：N/A"
-            body_lines.append(f"  {ticker} | {price_str} | {ema50_str} | 收益：{return_str} | 回撤：{drawdown_str}")
+            trend_ema_str = f"{trend_indicator}：${trend_ema:.2f}" if isinstance(trend_ema, (int, float)) else f"{trend_indicator}：N/A"
+            body_lines.append(f"  {ticker} | {price_str} | {trend_ema_str} | 收益：{return_str} | 回撤：{drawdown_str}")
     
     body = "\n".join(body_lines)
     return send_bark_notification(bark_key, title, body, group="动量系统", scan_time=scan_time)
@@ -460,26 +462,28 @@ def notify_momentum_combined(
                 ticker = p.get("ticker", "")
                 sell_reason = p.get("sell_reason", "未知")
                 latest_price = p.get("latest_price")
-                ema50 = p.get("ema50")
+                trend_indicator = p.get("trend_indicator") or "EMA50"
+                trend_ema = p.get("trend_ema", p.get("ema100", p.get("ema50")))
                 total_return = p.get("total_return", 0)
                 return_str = f"{total_return * 100:.2f}%" if isinstance(total_return, (int, float)) else "N/A"
                 price_str = f"${latest_price:.2f}" if isinstance(latest_price, (int, float)) else "N/A"
-                ema50_str = f"EMA50：${ema50:.2f}" if isinstance(ema50, (int, float)) else "EMA50：N/A"
-                body_lines.append(f"  🔴 {ticker} | {sell_reason} | {price_str} | {ema50_str} | 收益：{return_str}")
+                trend_ema_str = f"{trend_indicator}：${trend_ema:.2f}" if isinstance(trend_ema, (int, float)) else f"{trend_indicator}：N/A"
+                body_lines.append(f"  🔴 {ticker} | {sell_reason} | {price_str} | {trend_ema_str} | 收益：{return_str}")
         
         # 再显示持有
         if hold_positions:
             for p in hold_positions:
                 ticker = p.get("ticker", "")
                 latest_price = p.get("latest_price")
-                ema50 = p.get("ema50")
+                trend_indicator = p.get("trend_indicator") or "EMA50"
+                trend_ema = p.get("trend_ema", p.get("ema100", p.get("ema50")))
                 total_return = p.get("total_return", 0)
                 max_drawdown = p.get("max_drawdown", 0)
                 return_str = f"{total_return * 100:.2f}%" if isinstance(total_return, (int, float)) else "N/A"
                 drawdown_str = f"{max_drawdown * 100:.2f}%" if isinstance(max_drawdown, (int, float)) else "N/A"
                 price_str = f"${latest_price:.2f}" if isinstance(latest_price, (int, float)) else "N/A"
-                ema50_str = f"EMA50：${ema50:.2f}" if isinstance(ema50, (int, float)) else "EMA50：N/A"
-                body_lines.append(f"  ✅ {ticker} | {price_str} | {ema50_str} | 收益：{return_str} | 回撤：{drawdown_str}")
+                trend_ema_str = f"{trend_indicator}：${trend_ema:.2f}" if isinstance(trend_ema, (int, float)) else f"{trend_indicator}：N/A"
+                body_lines.append(f"  ✅ {ticker} | {price_str} | {trend_ema_str} | 收益：{return_str} | 回撤：{drawdown_str}")
     else:
         body_lines.append("📈 持仓状态：无持仓")
     

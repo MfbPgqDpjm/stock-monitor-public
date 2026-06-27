@@ -13,6 +13,7 @@ from state_manager import (
     load_config,
     load_signals,
     update_and_save_signals, # 使用新增的增量更新函数
+    configured_signal_keys,
     detect_signal_changes,
     append_history,
     save_scan_status,
@@ -20,12 +21,8 @@ from state_manager import (
 from notifier import (
     notify_market_scan_signals,
     notify_voo_rebalance,
-    notify_momentum_sell,
-    notify_momentum_buy,
-    notify_momentum_status,
     notify_momentum_combined,
 )
-
 # 抑制APScheduler的调试日志
 logging.getLogger('apscheduler').setLevel(logging.WARNING)
 
@@ -38,11 +35,17 @@ _scheduler_lock = threading.Lock()
 _scan_lock = threading.Lock() # 全局锁，确保同一秒只能有一个扫描在跑
 
 ET_TIMEZONE = pytz.timezone("America/New_York")
+SCAN_END_BLANK_LINES = 10
 
 _TZ_PREFIX_MAP = {
     "ET": "America/New_York",
     "CN": "Asia/Shanghai",
 }
+
+
+def _log_scan_end_spacing() -> None:
+    """扫描结束后追加空白行，方便从日志里区分新旧扫描块。"""
+    logger.info("\n" * SCAN_END_BLANK_LINES)
 
 def parse_scan_times(scan_time_str: str) -> List[Tuple[int, int, str, str]]:
     """解析配置字符串，例如 ET0935,CN1700"""
@@ -147,7 +150,11 @@ def execute_scan(manual_dt: Optional[datetime] = None, is_manual: bool = False):
         # 第四步：保存到文件
         # 核心：【增量更新】保存到文件
         # 这步确保了没扫到的股票保留旧值，扫到的更新新值
-        final_signals = update_and_save_signals(new_results, scan_time=now_obj)
+        final_signals = update_and_save_signals(
+            new_results,
+            scan_time=now_obj,
+            active_signal_keys=configured_signal_keys(config),
+        )
 
         # 5. 历史记录（仅在实际发生信号字符串变化时追加）
         if changes:
@@ -165,13 +172,14 @@ def execute_scan(manual_dt: Optional[datetime] = None, is_manual: bool = False):
             )
             logger.info(f"市场信号快照 Bark 推送 {sent} 条")
 
-        # 6. 特殊提醒：再平衡
+        # 特殊提醒：再平衡
         reb_trade, _ = parse_rebalance_config(config)
         rebalance_data = final_signals.get(reb_trade, {})
         if rebalance_data.get("signal") == "再平衡提醒":
-            notify_voo_rebalance(config.get("bark_key"), scan_time=now_obj, rebalance_ticker=reb_trade)
+            ok = notify_voo_rebalance(config.get("bark_key"), scan_time=now_obj, rebalance_ticker=reb_trade)
+            logger.info(f"{reb_trade} 再平衡 Bark 推送 {'成功' if ok else '失败'}")
 
-        # 7. 更新最终状态
+        # 6. 更新最终状态
         success_count = len([k for k, v in new_results.items() if k != "last_update" and isinstance(v, dict) and v.get("signal") != "ERROR"])
         error_count = len([k for k, v in new_results.items() if k != "last_update" and isinstance(v, dict) and v.get("signal") == "ERROR"])
         status_msg = f"完成: 成功 {success_count} 只" + (f", 失败 {error_count} 只" if error_count > 0 else "")
@@ -196,9 +204,8 @@ def execute_scan(manual_dt: Optional[datetime] = None, is_manual: bool = False):
                 buy_signal = momentum_result.get("buy_signal", {})
                 pending_buy_signals = momentum_result.get("pending_buy_signals", [])
                 max_positions = int(config.get("MAX_MOMENTUM_POSITIONS", 3))
-                
-                # 合并推送：系统状态 + 持仓状态 + 买卖信号
-                notify_momentum_combined(
+
+                ok = notify_momentum_combined(
                     config.get("bark_key"),
                     position_audit,
                     buy_signal,
@@ -206,6 +213,7 @@ def execute_scan(manual_dt: Optional[datetime] = None, is_manual: bool = False):
                     pending_buy_signals=pending_buy_signals,
                     max_positions=max_positions,
                 )
+                logger.info(f"动量系统 Bark 合并推送 {'成功' if ok else '失败'}")
         except Exception as e:
             logger.error(f"动量评分系统执行失败：{str(e)}")
         
@@ -216,8 +224,11 @@ def execute_scan(manual_dt: Optional[datetime] = None, is_manual: bool = False):
         save_scan_status(f"异常失败: {str(e)}", scan_time=now_obj)
         return {}, []
     finally:
-        # 释放锁
-        _scan_lock.release()
+        try:
+            _log_scan_end_spacing()
+        finally:
+            # 释放锁
+            _scan_lock.release()
 
 @st.cache_resource
 def get_scheduler() -> BackgroundScheduler:

@@ -4,7 +4,7 @@
 - 美元市值 >= MIN_MARKET_CAP
 - 20 日收盘突破入场，候选按 RS120 排名
 - 最多 3 只等权持仓，持仓期间不因 RS 变化换仓
-- 卖出：Close_t < EMA50_t
+- 卖出：Close_t < 配置趋势 EMA_t（默认 EMA50）
 - 信号收盘判定，次日开盘执行
 """
 import json
@@ -17,8 +17,20 @@ import pytz
 import logging
 import yfinance as yf
 
-from strategy import _apply_time_slice, fetch_with_retry, _get_market_status
-from state_manager import get_data_path, EXECUTION_LOG_MAX, trade_execution_timestamp
+from strategy import (
+    _apply_time_slice,
+    _df_from_cache_entry,
+    _load_data_cache,
+    fetch_with_retry,
+    _get_market_status,
+)
+from state_manager import (
+    get_data_path,
+    EXECUTION_LOG_MAX,
+    trade_execution_timestamp,
+    parse_momentum_ticker_entry,
+    get_momentum_ticker_configs,
+)
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -28,6 +40,10 @@ ET_TIMEZONE = pytz.timezone("America/New_York")
 DEFAULT_MIN_MARKET_CAP = 1_000_000_000
 DEFAULT_MAX_POSITIONS = 3
 RS_WINDOW = 120
+MOMENTUM_EMA_WINDOW = 50
+TREND_AGE_FIRST_THRESHOLD = 20
+TREND_AGE_MID_THRESHOLD = 60
+MARKET_CAP_EXEMPT_TICKERS = {"159915.SZ"}
 DEFAULT_MARKET_CAP_FX_RATES = {
     "USD": 1.0,
     "HKD": 0.128,
@@ -74,6 +90,20 @@ def format_rs_pct(rs: Optional[float], decimals: int = 2) -> str:
     return f"{sign}{pct:.{decimals}f}%"
 
 
+def _format_log_num(value: Any, decimals: int = 2, prefix: str = "", suffix: str = "") -> str:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(num):
+        return "-"
+    return f"{prefix}{num:.{decimals}f}{suffix}"
+
+
+def _format_log_bool(value: Any) -> str:
+    return "是" if bool(value) else "否"
+
+
 def top_eligible_scored_stock(scanned_stocks: List[Dict]) -> Optional[Dict[str, Any]]:
     """兼容旧 import：V3 返回 eligible 候选中 RS120 最高者。"""
     return top_eligible_rs_stock(scanned_stocks)
@@ -116,21 +146,32 @@ class MomentumScorer:
         self._market_cap_cache: Dict[str, Dict[str, Any]] = {}
         self._market_cap_warning_seen = set()
         self.max_positions = int(config.get("MAX_MOMENTUM_POSITIONS", DEFAULT_MAX_POSITIONS))
-        self.tickers = config.get("tickers", [])
+        self.ticker_configs = get_momentum_ticker_configs(config)
+        self.tickers = [t["ticker"] for t in self.ticker_configs]
         
         # 统一状态存储
         self.state = self._load_state()
+        self._state_dirty_on_load = False
         # 支持多持仓模式
         self.positions = self.state.get("current_positions", [])
         # 兼容旧的单持仓模式
         if not self.positions and "current_position" in self.state and self.state["current_position"]:
             self.positions = [self.state["current_position"]]
+        self.positions = self._normalize_ticker_records(self.positions, "current_positions")
+        self.state["current_positions"] = self.positions
+        if isinstance(self.state.get("current_position"), dict) and self.state["current_position"].get("ticker"):
+            current_position = self._normalize_ticker_record(self.state["current_position"], "current_position")
+            self.state["current_position"] = current_position
         self.history = self.state.get("history", [])
+        self.history = self._normalize_ticker_records(self.history, "history")
+        self.state["history"] = self.history
         self.pending_buy_signals = self._normalize_pending_buy_signals()
         self.pending_buy_signal = self.pending_buy_signals[0] if self.pending_buy_signals else {}
         
         # 执行日志
         self.execution_logs = self.state.get("execution_logs", [])
+        if self._state_dirty_on_load:
+            self._save_state()
     
     def _load_state(self) -> Dict[str, Any]:
         """加载统一状态文件 momentum_state.json"""
@@ -154,11 +195,42 @@ class MomentumScorer:
         """读取 V3 pending 列表；兼容旧版单个 pending_buy_signal。"""
         raw_list = self.state.get("pending_buy_signals")
         if isinstance(raw_list, list):
-            return [p for p in raw_list if isinstance(p, dict) and p.get("ticker")]
+            clean = self._normalize_ticker_records(
+                [p for p in raw_list if isinstance(p, dict) and p.get("ticker")],
+                "pending_buy_signals",
+            )
+            self.state["pending_buy_signals"] = clean
+            self.state["pending_buy_signal"] = clean[0] if clean else {}
+            return clean
         legacy = self.state.get("pending_buy_signal")
         if isinstance(legacy, dict) and legacy.get("ticker"):
-            return [legacy]
+            clean = [self._normalize_ticker_record(legacy, "pending_buy_signal")]
+            self.state["pending_buy_signals"] = clean
+            self.state["pending_buy_signal"] = clean[0]
+            return clean
+        self.state["pending_buy_signals"] = []
+        self.state["pending_buy_signal"] = {}
         return []
+
+    def _normalize_ticker_record(self, record: Dict[str, Any], context: str) -> Dict[str, Any]:
+        ticker = record.get("ticker")
+        configured_ticker = self._configured_ticker_for(ticker)
+        if configured_ticker and ticker and configured_ticker != str(ticker).strip().upper():
+            normalized = record.copy()
+            normalized["ticker"] = configured_ticker
+            self._state_dirty_on_load = True
+            logger.info(f"[状态规范化] {context}: {ticker} -> {configured_ticker}")
+            return normalized
+        return record
+
+    def _normalize_ticker_records(self, records: Any, context: str) -> List[Dict[str, Any]]:
+        if not isinstance(records, list):
+            return []
+        normalized = []
+        for record in records:
+            if isinstance(record, dict):
+                normalized.append(self._normalize_ticker_record(record, context))
+        return normalized
     
     def _save_state(self):
         """保存统一状态文件（原子写入）"""
@@ -267,6 +339,11 @@ class MomentumScorer:
             now_et: 当前时间
             purpose: 用途（scan=扫描，execute=执行）
         """
+        original_ticker = str(ticker or "").strip().upper()
+        ticker = self._configured_ticker_for(ticker)
+        if ticker and original_ticker and ticker != original_ticker:
+            logger.info(f"[数据获取] {original_ticker} 使用配置行情代码 {ticker}")
+
         logger.debug(f"[数据获取] 尝试获取 {ticker} 数据 (purpose={purpose})")
         
         # 优先从 data_cache 中获取数据
@@ -329,52 +406,199 @@ class MomentumScorer:
                 logger.warning(f"[数据获取] 直接下载失败或为空：{ticker}")
         except Exception as e:
             logger.error(f"[数据获取] 直接下载出错：{str(e)}")
+
+        cached_data = self._load_cached_market_data(ticker, now_et=now_et, purpose=purpose)
+        if cached_data is not None:
+            logger.warning(f"[数据获取] {ticker} 直接下载失败，使用磁盘缓存 {cached_data.index[-1].date()}")
+            return cached_data
         
         return None
+
+    def _load_cached_market_data(self, ticker: str, now_et: Optional[datetime] = None, purpose: str = "scan") -> Optional[pd.DataFrame]:
+        try:
+            cache = _load_data_cache()
+            entry = (cache.get("data") or {}).get(ticker)
+            data = _df_from_cache_entry(entry)
+            if data is None or data.empty:
+                return None
+
+            if now_et is not None:
+                close_series = data["Close"].squeeze()
+                if isinstance(close_series, pd.Series):
+                    sliced_close = _apply_time_slice(close_series, now_et, market="US", purpose=purpose)
+                    if sliced_close.empty:
+                        logger.warning(f"[数据获取] {ticker} 磁盘缓存切片后为空")
+                        return None
+                    data = data.loc[sliced_close.index]
+            return data
+        except Exception as exc:
+            logger.warning(f"[数据获取] {ticker} 读取磁盘缓存失败: {exc}")
+            return None
     
-    def _compute_indicators(self, data: pd.DataFrame) -> Dict[str, Any]:
+    def _indicator_for_ticker(self, ticker: str) -> Dict[str, Any]:
+        ticker_u = self._configured_ticker_for(ticker)
+        for cfg in self.ticker_configs:
+            if cfg.get("ticker") == ticker_u:
+                return cfg
+        return parse_momentum_ticker_entry(ticker_u)
+
+    def _signal_ticker_for(self, ticker: str) -> str:
+        cfg = self._indicator_for_ticker(ticker)
+        return str(cfg.get("signal_ticker") or cfg.get("ticker") or ticker).strip().upper()
+
+    def _configured_ticker_for(self, ticker: str) -> str:
+        """Resolve display/legacy tickers to configured Yahoo symbols."""
+        ticker_u = str(ticker or "").strip().upper()
+        if not ticker_u:
+            return ""
+
+        configured = {str(cfg.get("ticker", "")).upper() for cfg in self.ticker_configs}
+        if ticker_u in configured:
+            return ticker_u
+
+        # Some state/UI rows use a display symbol such as VUAA while config uses VUAA.L.
+        for cfg_ticker in configured:
+            if "." in cfg_ticker and cfg_ticker.split(".", 1)[0] == ticker_u:
+                return cfg_ticker
+
+        return ticker_u
+
+    def _compute_indicators(self, data: pd.DataFrame, ema_window: int = MOMENTUM_EMA_WINDOW) -> Dict[str, Any]:
         """
-        计算指标 - 严格对齐索引
+        计算指标 - 严格对齐索引，短历史标的回退到可用窗口
         
         公式：
         - HHV20_{t-1}: 使用 hhv20.iloc[-2] (截止到昨天的 20 日最高价)
         - HHV20_{t-2}: 使用 hhv20.iloc[-3] (截止到前天的 20 日最高价)
         - CLOSE_t: 使用 close.iloc[-1] (今日收盘价)
         - CLOSE_{t-1}: 使用 close.iloc[-2] (昨日收盘价)
-        - EMA50_t: 使用 close.ewm(span=50).mean().iloc[-1]
+        - EMA_t: 使用 close.ewm(span=配置窗口).mean().iloc[-1]，默认 EMA50
         - RS120: Close_t / Close_{t-120} - 1
+        若历史不足完整窗口，则使用已有的尽可能长历史：
+        - HHV 使用可覆盖 t-1/t-2 的最大可用窗口
+        - RS 使用最早可用收盘价作为基准
+        - EMA 仍使用配置 span，但标记为短历史估算
         """
         if data is None or data.empty:
             return {}
         
         # 确保 close 是一个 Series
         close = data["Close"].squeeze()
-        
-        min_len = max(self.hhv_window + 2, RS_WINDOW + 1, 50)
-        if len(close) < min_len:
-            logger.debug(f"[指标计算] 数据长度不足 {min_len}，无法计算")
+
+        if len(close) < 3:
+            logger.debug("[指标计算] 数据长度不足 3，无法计算突破所需的 t/t-1/t-2")
             return {}
-        
-        hhv20 = close.rolling(window=self.hhv_window).max()
-        ema50 = close.ewm(span=50, adjust=False).mean()
-        close_120 = float(close.iloc[-(RS_WINDOW + 1)])
+
+        available_len = len(close)
+        ema_window = int(ema_window or MOMENTUM_EMA_WINDOW)
+        hhv_window_used = min(self.hhv_window, available_len - 2)
+        rs_window_used = min(RS_WINDOW, available_len - 1)
+        limited_history = (
+            hhv_window_used < self.hhv_window
+            or rs_window_used < RS_WINDOW
+            or available_len < ema_window
+        )
+
+        hhv20 = close.rolling(window=hhv_window_used).max()
+        trend_ema = close.ewm(span=ema_window, adjust=False).mean()
+        rs_base = float(close.iloc[-(rs_window_used + 1)])
+        trend_indicator = f"EMA{ema_window}"
+        latest_close = float(close.iloc[-1])
+        latest_trend_ema = float(trend_ema.iloc[-1])
         
         indicators = {
-            "close": float(close.iloc[-1]),
+            "close": latest_close,
             "close_prev": float(close.iloc[-2]),
             "hhv20_prev": float(hhv20.iloc[-2]),
             "hhv20_prev_prev": float(hhv20.iloc[-3]),
-            "ema50": float(ema50.iloc[-1]),
-            "rs120": (float(close.iloc[-1]) / close_120 - 1) if close_120 > 0 else None,
+            "ema100": latest_trend_ema,
+            "trend_ema": latest_trend_ema,
+            "trend_indicator": trend_indicator,
+            "trend_ema_window": ema_window,
+            "rs120": (latest_close / rs_base - 1) if rs_base > 0 else None,
+            "ema_deviation_pct": (latest_close / latest_trend_ema - 1) * 100 if latest_trend_ema > 0 else None,
+            "limited_history": limited_history,
+            "history_bars": available_len,
+            "hhv_window_used": hhv_window_used,
+            "rs_window_used": rs_window_used,
         }
         
         logger.debug(
             f"[指标计算] close_t={indicators['close']:.4f}, close_t1={indicators['close_prev']:.4f}, "
             f"hhv20_t1={indicators['hhv20_prev']:.4f}, hhv20_t2={indicators['hhv20_prev_prev']:.4f}, "
-            f"ema50={indicators['ema50']:.4f}, rs120={format_rs_pct(indicators['rs120'])}"
+            f"{trend_indicator}={indicators['trend_ema']:.4f}, rs120={format_rs_pct(indicators['rs120'])}, "
+            f"history_bars={available_len}, hhv_window_used={hhv_window_used}, "
+            f"rs_window_used={rs_window_used}, limited_history={limited_history}"
         )
         
         return indicators
+
+    def _classify_trend_age(self, data: pd.DataFrame, ema_window: int = MOMENTUM_EMA_WINDOW) -> Dict[str, Any]:
+        """计算今天买入信号相对最近一次卖出后首次买入的趋势年龄。"""
+        if data is None or data.empty or "Close" not in data:
+            return {}
+
+        close = data["Close"].squeeze()
+        if len(close) < 3:
+            return {}
+
+        ema_window = int(ema_window or MOMENTUM_EMA_WINDOW)
+        hhv_window_used = min(self.hhv_window, len(close) - 2)
+        hhv = close.rolling(window=hhv_window_used).max()
+        trend_ema = close.ewm(span=ema_window, adjust=False).mean()
+
+        buy_signal = (close > trend_ema) & (close > hhv.shift(1)) & (close.shift(1) <= hhv.shift(2))
+        sell_signal = close < trend_ema
+        latest_pos = len(close) - 1
+
+        if not bool(buy_signal.iloc[latest_pos]):
+            return {}
+
+        prior_sell_positions = [
+            pos for pos, has_signal in enumerate(sell_signal.iloc[:latest_pos])
+            if bool(has_signal)
+        ]
+        trend_age_estimated = False
+        last_sell_pos = None
+        if prior_sell_positions:
+            last_sell_pos = prior_sell_positions[-1]
+            buy_after_sell_positions = [
+                pos for pos in range(last_sell_pos + 1, latest_pos + 1)
+                if bool(buy_signal.iloc[pos])
+            ]
+        else:
+            trend_age_estimated = True
+            buy_after_sell_positions = [
+                pos for pos in range(0, latest_pos + 1)
+                if bool(buy_signal.iloc[pos])
+            ]
+        if not buy_after_sell_positions:
+            return {}
+
+        first_buy_pos = buy_after_sell_positions[0]
+        trend_age = latest_pos - first_buy_pos
+        if trend_age <= TREND_AGE_FIRST_THRESHOLD:
+            trend_age_stage = "首次趋势"
+            position_size_hint = "正常仓位"
+        elif trend_age <= TREND_AGE_MID_THRESHOLD:
+            trend_age_stage = "中期趋势"
+            position_size_hint = "半仓"
+        else:
+            trend_age_stage = "老趋势"
+            position_size_hint = "观察仓"
+
+        return {
+            "trend_age": trend_age,
+            "trend_age_stage": trend_age_stage,
+            "position_size_hint": position_size_hint,
+            "trend_age_estimated": trend_age_estimated,
+            "trend_age_basis": "可用历史内首次买入" if trend_age_estimated else "最近卖出后首次买入",
+            "last_sell_signal_date": close.index[last_sell_pos].date().isoformat() if last_sell_pos is not None else None,
+            "first_buy_after_sell_date": close.index[first_buy_pos].date().isoformat(),
+            "latest_buy_signal_date": close.index[latest_pos].date().isoformat(),
+            "trend_age_first_threshold": TREND_AGE_FIRST_THRESHOLD,
+            "trend_age_mid_threshold": TREND_AGE_MID_THRESHOLD,
+        }
     
     def _warn_market_cap_once(self, ticker: str, message: str) -> None:
         """同一 ticker 的市值 warning 只打一次，避免 Streamlit/扫描重复刷屏。"""
@@ -499,6 +723,18 @@ class MomentumScorer:
 
     def _check_market_cap_filter(self, ticker: str) -> Dict[str, Any]:
         """市值过滤：美元市值 >= MIN_MARKET_CAP。"""
+        ticker_u = str(ticker or "").strip().upper()
+        if ticker_u in MARKET_CAP_EXEMPT_TICKERS:
+            return {
+                "market_cap": None,
+                "market_cap_currency": None,
+                "market_cap_fx_rate": None,
+                "market_cap_usd": None,
+                "market_cap_source": "exempt",
+                "market_cap_ok": True,
+                "market_cap_reason": "资产规模检查豁免",
+            }
+
         cap = self._get_market_cap(ticker)
         market_cap_usd = cap.get("market_cap_usd")
         ok = market_cap_usd is not None and market_cap_usd >= self.min_market_cap
@@ -508,6 +744,122 @@ class MomentumScorer:
             "market_cap_ok": ok,
             "market_cap_reason": reason,
         }
+
+    def _log_scan_stock_details(
+        self,
+        scanned_stocks: List[Dict[str, Any]],
+        selected_candidates: List[Dict[str, Any]],
+    ) -> None:
+        """逐票打印买入决策，重点解释为什么选中或未选中。"""
+        if not scanned_stocks:
+            return
+
+        active_positions = [p for p in self.positions if not p.get("sell_flag")]
+        pending_set = {
+            self._configured_ticker_for(p.get("ticker"))
+            for p in self.pending_buy_signals
+        }
+        available_slots = max(0, self.max_positions - len(active_positions) - len(self.pending_buy_signals))
+
+        rs_rank_by_ticker: Dict[str, int] = {}
+        rs_rank = 0
+        for stock in scanned_stocks:
+            rs120 = stock.get("rs120")
+            if not isinstance(rs120, (int, float)) or not math.isfinite(float(rs120)):
+                continue
+            rs_rank += 1
+            rs_rank_by_ticker[str(stock.get("ticker", "")).upper()] = rs_rank
+
+        candidate_rank_by_ticker = {
+            str(stock.get("ticker", "")).upper(): idx
+            for idx, stock in enumerate(selected_candidates, start=1)
+        }
+
+        logger.info(
+            "[买入扫描][决策] 逐票原因，共 %s 只，可用仓位=%s",
+            len(scanned_stocks),
+            available_slots,
+        )
+        for stock in scanned_stocks:
+            ticker = str(stock.get("ticker", "") or "-")
+            ticker_u = ticker.upper()
+            trend_indicator = str(stock.get("trend_indicator") or f"EMA{stock.get('trend_ema_window') or ''}").strip()
+            if not trend_indicator or trend_indicator == "EMA":
+                trend_indicator = "趋势EMA"
+
+            close_above_trend = bool(stock.get("close_above_trend_ema"))
+            breakout = bool(stock.get("breakout"))
+            market_cap_ok = bool(stock.get("market_cap_ok"))
+            candidate_rank = candidate_rank_by_ticker.get(ticker_u)
+            is_pending = ticker_u in pending_set
+            is_position = bool(stock.get("is_position"))
+            is_eligible = bool(stock.get("eligible"))
+
+            if is_eligible and candidate_rank is not None and candidate_rank <= available_slots:
+                decision = "选中"
+                decision_reason = "符合买入条件且在可用仓位内"
+            elif is_eligible and is_position:
+                decision = "未选中"
+                decision_reason = "已持仓，不重复买入"
+            elif is_eligible and is_pending:
+                decision = "未选中"
+                decision_reason = "已有待买信号，不重复标记"
+            elif is_eligible and available_slots <= 0:
+                decision = "未选中"
+                decision_reason = "持仓/待买已占满可用仓位"
+            elif is_eligible:
+                decision = "未选中"
+                decision_reason = f"候选排名 {candidate_rank or '-'} 超过可用仓位 {available_slots}"
+            else:
+                decision = "未选中"
+                decision_reason = stock.get("reason") or "-"
+
+            block_bits = []
+            if not close_above_trend:
+                block_bits.append(f"未站上{trend_indicator}")
+            if close_above_trend and not breakout:
+                block_bits.append("未突破HH20")
+            if close_above_trend and breakout and not market_cap_ok:
+                block_bits.append(stock.get("market_cap_reason") or "市值/资产规模未通过")
+            block_text = "；".join(block_bits) if block_bits else decision_reason
+
+            trend_age_bits = []
+            if stock.get("trend_age") is not None:
+                trend_age_bits.extend([
+                    f"趋势年龄={stock.get('trend_age')}日",
+                    f"阶段={stock.get('trend_age_stage') or '-'}",
+                ])
+                if stock.get("trend_age_estimated"):
+                    trend_age_bits.append("历史不足估算")
+            trend_age_text = " ".join(trend_age_bits)
+            history_text = " 短历史=是" if stock.get("limited_history") else ""
+            trend_age_suffix = f" {trend_age_text}" if trend_age_text else ""
+
+            logger.info(
+                "[买入扫描][决策] %s %s | 信号=%s | RS#%s 候选#%s | "
+                "交易价=%s 信号收盘=%s %s=%s 偏离=%s HH20前高=%s RS120=%s | "
+                "趋势=%s 突破=%s 市值=%s 持仓=%s 待买=%s%s%s | 原因=%s",
+                ticker,
+                decision,
+                stock.get("signal_ticker") or ticker,
+                rs_rank_by_ticker.get(ticker_u, "-"),
+                candidate_rank or "-",
+                _format_log_num(stock.get("latest_price"), 4),
+                _format_log_num(stock.get("signal_latest_price"), 4),
+                trend_indicator,
+                _format_log_num(stock.get("trend_ema"), 4),
+                _format_log_num(stock.get("ema_deviation_pct"), 2, suffix="%"),
+                _format_log_num(stock.get("hh20_prev"), 4),
+                format_rs_pct(stock.get("rs120")) or "-",
+                _format_log_bool(close_above_trend),
+                _format_log_bool(breakout),
+                "是" if market_cap_ok else "否/未检查",
+                _format_log_bool(is_position),
+                _format_log_bool(is_pending),
+                history_text,
+                trend_age_suffix,
+                block_text,
+            )
 
     def _open_for_trade_date(self, data: Optional[pd.DataFrame], trade_date: date) -> Optional[float]:
         """取 trade_date 当日日 K 的 Open；缺行或无效则返回 None（禁止回退 iloc[-1]）。"""
@@ -653,8 +1005,8 @@ class MomentumScorer:
         """
         持仓审计 - 支持多持仓。
 
-        卖出规则：Close_t < EMA50_t。
-        仍保留 peak_high_t / drawdown / total_return 展示字段。
+        卖出规则：Close_t < 配置趋势 EMA_t（默认 EMA50）。
+        仍保留 peak_high_t / max_drawdown / total_return 展示字段。
         数据与扫描一致：`_get_market_data` 内已对未收盘日做切片，盘后则保留完整最新 bar。
         """
         if not self.positions:
@@ -666,8 +1018,12 @@ class MomentumScorer:
             ticker = position.get("ticker")
             buy_price = position.get("buy_price")
             buy_date = position.get("buy_date")
+            indicator_cfg = self._indicator_for_ticker(ticker)
+            trend_indicator = indicator_cfg["indicator"]
+            ema_window = indicator_cfg["ema_window"]
+            signal_ticker = self._signal_ticker_for(ticker)
             
-            # 获取最新数据
+            # 交易标的用于持仓收益/回撤；信号观察标的用于 EMA 卖出判断。
             data = self._get_market_data(ticker, now_et=now)
             if data is None:
                 audit_results.append({
@@ -675,13 +1031,29 @@ class MomentumScorer:
                     "ticker": ticker
                 })
                 continue
+            signal_data = data if signal_ticker == str(ticker).strip().upper() else self._get_market_data(signal_ticker, now_et=now)
+            if signal_data is None:
+                audit_results.append({
+                    "status": "信号数据获取失败",
+                    "ticker": ticker,
+                    "signal_ticker": signal_ticker,
+                })
+                continue
         
             # 切片序列：与扫描口径一致
             close = data["Close"].squeeze()
             high = data["High"].squeeze()
             close_t = float(close.iloc[-1])
-            ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
             latest_date = close.index[-1].strftime("%Y-%m-%d")
+            signal_close = signal_data["Close"].squeeze()
+            signal_close_t = float(signal_close.iloc[-1])
+            trend_ema = float(signal_close.ewm(span=ema_window, adjust=False).mean().iloc[-1])
+            buy_date_obj = datetime.strptime(buy_date, "%Y-%m-%d").date()
+            buy_date_idx = None
+            for i in range(len(close)):
+                if close.index[i].date() == buy_date_obj:
+                    buy_date_idx = i
+                    break
             
             prev_stored = position.get("peak_high_t")
             
@@ -691,12 +1063,6 @@ class MomentumScorer:
             if current_peak_high is None:
                 logger.warning(f"[持仓审计] {ticker} peak_high_t 不存在，以成本价为底并从 buy_date 抬升")
                 current_peak_high = cost_floor
-                buy_date_obj = datetime.strptime(buy_date, "%Y-%m-%d").date()
-                buy_date_idx = None
-                for i in range(len(high)):
-                    if high.index[i].date() == buy_date_obj:
-                        buy_date_idx = i
-                        break
                 if buy_date_idx is not None:
                     high_since_buy = high.iloc[buy_date_idx:]
                     current_peak_high = max(cost_floor, float(high_since_buy.max()))
@@ -716,37 +1082,55 @@ class MomentumScorer:
                 self._update_positions(self.positions)
             
             # 计算持股天数（基于数据窗口，包含买入当天）
-            buy_date_obj = datetime.strptime(buy_date, "%Y-%m-%d").date()
-            buy_date_idx = None
-            for i in range(len(close)):
-                if close.index[i].date() == buy_date_obj:
-                    buy_date_idx = i
-                    break
-            
             if buy_date_idx is not None:
-                hold_days = len(close.iloc[buy_date_idx:])
+                close_since_buy = close.iloc[buy_date_idx:].astype(float)
+                high_since_buy = high.iloc[buy_date_idx:].astype(float)
+                hold_days = len(close_since_buy)
             else:
+                close_since_buy = None
+                high_since_buy = None
                 hold_days = (now.date() - buy_date_obj).days + 1  # 包含买入当天
             
-            # high-to-close 最大回撤：drawdown_t = (peak_high_t - close_t) / peak_high_t
-            # peak_high_t = max(High_entry .. High_t)；分母为持仓期历史最高 High，分子为 peak - 当日收盘
+            # 持仓期最大回撤：逐日从 running peak high 到当日 close 的最大跌幅。
+            # 若数据窗口缺少买入日，退回到最新 close 相对已记录 peak_high_t 的当前回撤，避免伪造历史最大值。
             if peak_high_t <= 0:
                 logger.error(f"[持仓审计] {ticker} peak_high_t 非正，无法计算 drawdown")
                 max_drawdown = 0.0
+            elif close_since_buy is not None and high_since_buy is not None and not close_since_buy.empty:
+                running_peak = high_since_buy.cummax().clip(lower=cost_floor)
+                drawdown_series = (running_peak - close_since_buy) / running_peak
+                max_drawdown = max(0.0, float(drawdown_series.max()))
+                logger.debug(
+                    f"[持仓审计] {ticker} max_drawdown=max((running_peak_high-Close)/running_peak_high)={max_drawdown:.4f}"
+                )
             else:
                 max_drawdown = (peak_high_t - close_t) / peak_high_t
             
             total_return = (close_t / buy_price) - 1
             max_return = (peak_high_t / buy_price) - 1
             
-            sell_signal = close_t < ema50
-            sell_reason = "跌破EMA50" if sell_signal else ""
+            sell_signal = signal_close_t < trend_ema
+            sell_reason = f"跌破{trend_indicator}" if sell_signal else ""
+            logger.info(
+                "[持仓审计][卖出判断] %s %s | 信号=%s 收盘=%s %s=%s | 交易收盘=%s 收益=%s 回撤=%s 持仓天数=%s | 原因=%s",
+                ticker,
+                "待卖出" if sell_signal else "继续持有",
+                signal_ticker,
+                _format_log_num(signal_close_t, 4),
+                trend_indicator,
+                _format_log_num(trend_ema, 4),
+                _format_log_num(close_t, 4),
+                _format_log_num(total_return * 100, 2, suffix="%"),
+                _format_log_num(max_drawdown * 100, 2, suffix="%"),
+                hold_days,
+                sell_reason or f"未跌破{trend_indicator}",
+            )
             
             if sell_signal:
                 # 标记卖出 flag（次日执行）
                 position["sell_flag"] = True
                 # 使用数据的最后一个完整交易日作为信号日期
-                signal_date = data.index[-1].date().isoformat()
+                signal_date = signal_data.index[-1].date().isoformat()
                 position["sell_flag_date"] = signal_date
                 position["sell_reason"] = sell_reason
                 self._update_positions(self.positions)
@@ -761,10 +1145,15 @@ class MomentumScorer:
                     "buy_date": buy_date,
                     "latest_price": close_t,
                     "latest_date": latest_date,
+                    "signal_ticker": signal_ticker,
+                    "signal_latest_price": signal_close_t,
                     "total_return": total_return,
                     "max_return": max_return,
                     "max_drawdown": max_drawdown,
-                    "ema50": ema50,
+                    "ema100": trend_ema,
+                    "trend_ema": trend_ema,
+                    "trend_indicator": trend_indicator,
+                    "trend_ema_window": ema_window,
                     "hold_days": hold_days,
                     "sell_reason": sell_reason,
                     "execute_date": "次日开盘"
@@ -778,10 +1167,15 @@ class MomentumScorer:
                     "buy_date": buy_date,
                     "latest_price": close_t,
                     "latest_date": latest_date,
+                    "signal_ticker": signal_ticker,
+                    "signal_latest_price": signal_close_t,
                     "total_return": total_return,
                     "max_return": max_return,
                     "max_drawdown": max_drawdown,
-                    "ema50": ema50,
+                    "ema100": trend_ema,
+                    "trend_ema": trend_ema,
+                    "trend_indicator": trend_indicator,
+                    "trend_ema_window": ema_window,
                     "hold_days": hold_days
                 })
         
@@ -790,8 +1184,9 @@ class MomentumScorer:
     def _scan_for_buy(self, now: datetime) -> Dict[str, Any]:
         """
         扫描全部配置标的：
+        趋势：Close_t > 配置趋势 EMA_t（默认 EMA50）；
         突破：Close_t > HH20_{t-1} 且 Close_{t-1} <= HH20_{t-2}；
-        eligible = 市值 >= MIN_MARKET_CAP 且突破；
+        eligible = 市值 >= MIN_MARKET_CAP 且趋势过滤通过且突破；
         候选按 RS120 从高到低排序。
         """
         scanned_stocks: List[Dict[str, Any]] = []
@@ -800,32 +1195,54 @@ class MomentumScorer:
         n_no_data = 0
         n_bad_ind = 0
         n_cap_fail = 0
+        n_trend_fail = 0
         n_break_fail = 0
+        n_limited_history = 0
         data_failed: List[str] = []
-        held_tickers = {str(p.get("ticker", "")).upper() for p in self.positions}
-        pending_tickers = {str(p.get("ticker", "")).upper() for p in self.pending_buy_signals}
+        held_tickers = {self._configured_ticker_for(p.get("ticker")) for p in self.positions}
+        pending_tickers = {self._configured_ticker_for(p.get("ticker")) for p in self.pending_buy_signals}
 
-        for ticker in self.tickers:
+        for ticker_cfg in self.ticker_configs:
+            ticker = ticker_cfg["ticker"]
+            signal_ticker = str(ticker_cfg.get("signal_ticker") or ticker).upper()
+            trend_indicator = ticker_cfg["indicator"]
+            ema_window = ticker_cfg["ema_window"]
             ticker_u = str(ticker).upper()
             is_current_position = ticker_u in held_tickers
 
-            data = self._get_market_data(ticker, now_et=now)
+            data = self._get_market_data(signal_ticker, now_et=now)
+            trade_data = data if signal_ticker == ticker_u else self._get_market_data(ticker, now_et=now, purpose="trade")
             if data is None:
                 n_no_data += 1
-                data_failed.append(ticker)
+                data_failed.append(signal_ticker)
                 scanned_stocks.append({
                     "ticker": ticker,
+                    "signal_ticker": signal_ticker,
                     "latest_price": None,
+                    "signal_latest_price": None,
                     "latest_date": None,
+                    "close_prev": None,
                     "hh20_prev": None,
+                    "hh20_prev_prev": None,
                     "rs120": None,
-                    "ema50": None,
+                    "ema100": None,
+                    "trend_ema": None,
+                    "ema_deviation_pct": None,
+                    "trend_indicator": trend_indicator,
+                    "trend_ema_window": ema_window,
                     "market_cap": None,
                     "market_cap_currency": None,
                     "market_cap_fx_rate": None,
                     "market_cap_usd": None,
                     "market_cap_source": None,
                     "market_cap_ok": False,
+                    "market_cap_reason": "未检查",
+                    "limited_history": False,
+                    "history_bars": 0,
+                    "hhv_window_used": None,
+                    "rs_window_used": None,
+                    "close_above_ema100": False,
+                    "close_above_trend_ema": False,
                     "breakout": False,
                     "eligible": False,
                     "reason": "数据获取失败",
@@ -833,22 +1250,37 @@ class MomentumScorer:
                 })
                 continue
 
-            indicators = self._compute_indicators(data)
+            indicators = self._compute_indicators(data, ema_window=ema_window)
             if not indicators:
                 n_bad_ind += 1
                 scanned_stocks.append({
                     "ticker": ticker,
+                    "signal_ticker": signal_ticker,
                     "latest_price": None,
+                    "signal_latest_price": None,
                     "latest_date": data.index[-1].strftime("%Y-%m-%d"),
+                    "close_prev": None,
                     "hh20_prev": None,
+                    "hh20_prev_prev": None,
                     "rs120": None,
-                    "ema50": None,
+                    "ema100": None,
+                    "trend_ema": None,
+                    "ema_deviation_pct": None,
+                    "trend_indicator": trend_indicator,
+                    "trend_ema_window": ema_window,
                     "market_cap": None,
                     "market_cap_currency": None,
                     "market_cap_fx_rate": None,
                     "market_cap_usd": None,
                     "market_cap_source": None,
                     "market_cap_ok": False,
+                    "market_cap_reason": "未检查",
+                    "limited_history": False,
+                    "history_bars": len(data) if data is not None else 0,
+                    "hhv_window_used": None,
+                    "rs_window_used": None,
+                    "close_above_ema100": False,
+                    "close_above_trend_ema": False,
                     "breakout": False,
                     "eligible": False,
                     "reason": "指标数据不足",
@@ -860,30 +1292,67 @@ class MomentumScorer:
             c1 = indicators["close_prev"]
             h1 = indicators["hhv20_prev"]
             h2 = indicators["hhv20_prev_prev"]
-            ema50 = indicators["ema50"]
+            trend_ema = indicators["trend_ema"]
             rs120 = indicators["rs120"]
+            trend_indicator = indicators.get("trend_indicator", trend_indicator)
+            limited_history = bool(indicators.get("limited_history"))
+            if limited_history:
+                n_limited_history += 1
             latest_date = data.index[-1].strftime("%Y-%m-%d")
-            cap_filter = self._check_market_cap_filter(ticker_u)
 
+            close_above_trend_ema = c > trend_ema
             breakout = (c > h1) and (c1 <= h2)
-            eligible = bool(cap_filter["market_cap_ok"] and breakout)
+            trend_age_info = {}
+            latest_price = c
+            if trade_data is not None:
+                try:
+                    latest_price = float(trade_data["Close"].squeeze().iloc[-1])
+                except Exception:
+                    latest_price = c
+            cap_filter = {
+                "market_cap": None,
+                "market_cap_currency": None,
+                "market_cap_fx_rate": None,
+                "market_cap_usd": None,
+                "market_cap_source": None,
+                "market_cap_ok": False,
+                "market_cap_reason": "未检查",
+            }
 
-            if not breakout:
+            if not close_above_trend_ema:
+                n_trend_fail += 1
+                reason = f"未站上{trend_indicator}"
+            elif not breakout:
                 n_break_fail += 1
                 reason = "未满足20日突破"
-            elif not cap_filter["market_cap_ok"]:
-                n_cap_fail += 1
-                reason = "市值过滤未通过"
             else:
-                reason = "符合买入条件"
+                cap_filter = self._check_market_cap_filter(ticker_u)
+                if not cap_filter["market_cap_ok"]:
+                    n_cap_fail += 1
+                    reason = "市值过滤未通过"
+                else:
+                    trend_age_info = self._classify_trend_age(data, ema_window=ema_window)
+                    reason = "符合买入条件"
+
+            eligible = bool(close_above_trend_ema and breakout and cap_filter["market_cap_ok"])
+            if limited_history:
+                reason = f"{reason}（短历史估算）"
 
             stock_data = {
                 "ticker": ticker,
-                "latest_price": c,
+                "signal_ticker": signal_ticker,
+                "latest_price": latest_price,
+                "signal_latest_price": c,
                 "latest_date": latest_date,
                 "date": data.index[-1].date().isoformat(),
+                "close_prev": c1,
                 "hh20_prev": h1,
-                "ema50": ema50,
+                "hh20_prev_prev": h2,
+                "ema100": trend_ema,
+                "trend_ema": trend_ema,
+                "ema_deviation_pct": indicators.get("ema_deviation_pct"),
+                "trend_indicator": trend_indicator,
+                "trend_ema_window": indicators.get("trend_ema_window", ema_window),
                 "rs120": rs120,
                 "market_cap": cap_filter["market_cap"],
                 "market_cap_currency": cap_filter["market_cap_currency"],
@@ -891,9 +1360,26 @@ class MomentumScorer:
                 "market_cap_usd": cap_filter["market_cap_usd"],
                 "market_cap_source": cap_filter["market_cap_source"],
                 "market_cap_ok": cap_filter["market_cap_ok"],
+                "market_cap_reason": cap_filter.get("market_cap_reason"),
+                "limited_history": limited_history,
+                "history_bars": indicators.get("history_bars"),
+                "hhv_window_used": indicators.get("hhv_window_used"),
+                "rs_window_used": indicators.get("rs_window_used"),
+                "close_above_ema100": close_above_trend_ema,
+                "close_above_trend_ema": close_above_trend_ema,
                 "breakout": breakout,
                 "eligible": eligible,
                 "reason": reason,
+                "trend_age": trend_age_info.get("trend_age"),
+                "trend_age_stage": trend_age_info.get("trend_age_stage"),
+                "position_size_hint": trend_age_info.get("position_size_hint"),
+                "trend_age_estimated": trend_age_info.get("trend_age_estimated"),
+                "trend_age_basis": trend_age_info.get("trend_age_basis"),
+                "last_sell_signal_date": trend_age_info.get("last_sell_signal_date"),
+                "first_buy_after_sell_date": trend_age_info.get("first_buy_after_sell_date"),
+                "latest_buy_signal_date": trend_age_info.get("latest_buy_signal_date"),
+                "trend_age_first_threshold": trend_age_info.get("trend_age_first_threshold"),
+                "trend_age_mid_threshold": trend_age_info.get("trend_age_mid_threshold"),
                 "is_position": is_current_position,
             }
             scanned_stocks.append(stock_data)
@@ -907,6 +1393,7 @@ class MomentumScorer:
 
         scanned_stocks.sort(key=_sort_key)
         selected_candidates.sort(key=_sort_key)
+        self._log_scan_stock_details(scanned_stocks, selected_candidates)
 
         n_list = len(self.tickers)
         n_cand = sum(1 for s in scanned_stocks if s.get("eligible"))
@@ -918,8 +1405,9 @@ class MomentumScorer:
             top_bits = f" RS120首位={top['ticker']}({format_rs_pct(top['rs120'])}) Top5={','.join(top5)}"
         logger.info(
             f"[买入扫描] 汇总 名单={n_list} 美元市值阈值={self.min_market_cap:.0f} "
-            f"无数据={n_no_data} 指标不足={n_bad_ind} 市值未通过={n_cap_fail} 无突破={n_break_fail} "
-            f"可买候选={n_cand}{top_bits}"
+            f"无数据={n_no_data} 指标不足={n_bad_ind} 未站上趋势EMA={n_trend_fail} "
+            f"市值未通过={n_cap_fail} 无突破={n_break_fail} "
+            f"短历史估算={n_limited_history} 可买候选={n_cand}{top_bits}"
         )
         if data_failed:
             tail = data_failed[:30]
@@ -948,7 +1436,7 @@ class MomentumScorer:
         执行流程：
         1. 执行引擎：处理待执行的买入/卖出订单
         2. 持仓审计：检查当前持仓状态
-        3. 买入扫描：寻找 HH20 突破且市值达标的 RS120 强势候选
+        3. 买入扫描：寻找 Close > 配置趋势 EMA、HH20 突破且市值达标的 RS120 强势候选
         4. 状态更新：按可用仓位写入待买入信号；满仓不换仓
         """
         now = datetime.now(ET_TIMEZONE)

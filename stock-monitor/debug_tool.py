@@ -44,8 +44,15 @@ sys.path.insert(0, os.path.dirname(__file__))
 # 导入 state_manager
 import state_manager
 from strategy import run_full_scan
-from state_manager import load_config, load_signals, update_and_save_signals, save_scan_status, detect_signal_changes, append_history
-from notifier import notify_market_scan_signals
+from state_manager import (
+    load_config,
+    load_signals,
+    update_and_save_signals,
+    configured_signal_keys,
+    save_scan_status,
+    detect_signal_changes,
+    append_history,
+)
 
 import streamlit as st
 
@@ -107,9 +114,13 @@ def manual_test(mock_time_str: str):
     old_signals = load_signals()
     
     # 更新本地数据
-    updated_signals = update_and_save_signals(signals, scan_time=mock_now_et)
+    update_and_save_signals(
+        signals,
+        scan_time=mock_now_et,
+        active_signal_keys=configured_signal_keys(config),
+    )
     
-    # 检测信号变化（仅写入 history.json，与 Bark 推送解耦）
+    # 检测信号变化（仅写入 history.json）
     changes = detect_signal_changes(old_signals, signals, override_time=mock_now_et)
     
     # 输出信号变化结果
@@ -120,19 +131,12 @@ def manual_test(mock_time_str: str):
             print(f"[MOCK-SCAN]   - {c['ticker']}: {c['old_signal']} → {c['new_signal']}")
         append_history(changes)
 
-    bark_key = config.get("bark_key", "")
-    if bark_key:
-        sent = notify_market_scan_signals(
-            bark_key, updated_signals, scan_time=mock_now_et, is_lookback=False, is_debug=True, is_manual=True
-        )
-        print(f"[MOCK-SCAN] 市场信号快照 Bark 推送 {sent} 条")
-    else:
-        print("[MOCK-SCAN] Bark Key 未配置，跳过推送")
+    print("[MOCK-SCAN] 信号提醒已移除，跳过推送")
     
     # 保存扫描状态
     save_scan_status("手动测试模式扫描完成", scan_time=mock_now_et)
     
-    logging.info("[MOCK-SCAN] ✅ 模拟任务执行完毕，请检查 Bark 推送和数据文件。")
+    logging.info("[MOCK-SCAN] ✅ 模拟任务执行完毕，请检查数据文件。")
     logging.info(f"[MOCK-SCAN] 结果保存路径:")
     logging.info(f"[MOCK-SCAN]   信号文件: {signals_path}")
     logging.info(f"[MOCK-SCAN]   历史文件: {history_path}")
@@ -224,7 +228,11 @@ def main():
     old_signals = load_signals()
     
     # 更新本地数据
-    updated_signals = update_and_save_signals(signals, scan_time=scan_time)
+    update_and_save_signals(
+        signals,
+        scan_time=scan_time,
+        active_signal_keys=configured_signal_keys(config),
+    )
     
     # 检测信号变化（仅写入 history.json）
     changes = detect_signal_changes(old_signals, signals, override_time=scan_time)
@@ -237,14 +245,7 @@ def main():
             print(f"  - {c['ticker']}: {c['old_signal']} → {c['new_signal']}")
         append_history(changes)
 
-    bark_key = config.get("bark_key", "")
-    if bark_key:
-        sent = notify_market_scan_signals(
-            bark_key, updated_signals, scan_time=scan_time, is_lookback=False, is_debug=True, is_manual=True
-        )
-        print(f"市场信号快照 Bark 推送 {sent} 条")
-    else:
-        print("Bark Key 未配置，跳过推送")
+    print("信号提醒已移除，跳过推送")
     
     # 保存扫描状态
     save_scan_status("命令行模式扫描完成", scan_time=scan_time)
@@ -326,7 +327,11 @@ def streamlit_app():
                 old_signals = load_signals()
                 
                 # 更新本地数据
-                updated_signals = update_and_save_signals(signals, scan_time=target_now)
+                update_and_save_signals(
+                    signals,
+                    scan_time=target_now,
+                    active_signal_keys=configured_signal_keys(config),
+                )
                 
                 # 检测信号变化（仅写入 history.json）
                 changes = detect_signal_changes(old_signals, signals, override_time=target_now)
@@ -339,19 +344,7 @@ def streamlit_app():
                         logging.info(f"  - {c['ticker']}: {c['old_signal']} → {c['new_signal']}")
                     append_history(changes)
 
-                bark_key = config.get("bark_key", "")
-                if bark_key:
-                    sent = notify_market_scan_signals(
-                        bark_key,
-                        updated_signals,
-                        scan_time=target_now,
-                        is_lookback=False,
-                        is_debug=True,
-                        is_manual=True,
-                    )
-                    logging.info(f"市场信号快照 Bark 推送 {sent} 条")
-                else:
-                    logging.info("Bark Key 未配置，跳过推送")
+                logging.info("信号提醒已移除，跳过推送")
                 # 保存扫描状态
                 save_scan_status("手动时间模拟扫描完成", scan_time=target_now)
             st.success(f"✅ 观测点已更新到 {target_now.strftime('%Y-%m-%d %H:%M')}")

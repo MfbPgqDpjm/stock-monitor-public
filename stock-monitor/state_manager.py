@@ -2,7 +2,7 @@ import json
 import os
 import logging
 from datetime import datetime, date
-from typing import Any, Optional, Dict, List
+from typing import Any, Optional, Dict, List, Set
 
 # 尝试导入python-dotenv库
 try:
@@ -49,6 +49,15 @@ def _resolve_data_dir() -> str:
     if override and str(override).strip():
         return os.path.abspath(os.path.expanduser(str(override).strip()))
 
+    env_type = (os.environ.get("ENV_TYPE") or os.environ.get("env_type") or "").strip().upper()
+    if env_type == "DEVELOPMENT":
+        project_root = os.path.dirname(os.path.dirname(__file__))
+        sibling_prod_data = os.path.abspath(
+            os.path.join(project_root, "..", "Stock-Monitor-PROD", "stock-monitor", "data")
+        )
+        if os.path.isdir(sibling_prod_data):
+            logging.info(f"DEV 未配置 STOCK_MONITOR_DATA_DIR，自动使用 PROD data: {sibling_prod_data}")
+            return sibling_prod_data
 
     return _local_data_dir
 
@@ -84,6 +93,8 @@ def trade_execution_timestamp(trade_date: date, trade_type: str) -> str:
 DEFAULT_CONFIG = {
     "bark_key": "",
     "tickers": ["NVDA", "AAPL", "MSFT"],
+    "ytd_tickers": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "QQQ", "VOO", "TQQQ", "SPCX", "^KS11", "VUAA.L", "SOXL"],
+    "ytd_display_names": {"^KS11": ".KOSPI"},
     "us_stocks": "TQQQ:QQQ:1.03:2",
     "scan_time": "ET0935,ET1605",
     "hhv_period": 20,
@@ -92,7 +103,113 @@ DEFAULT_CONFIG = {
     "MAX_MOMENTUM_POSITIONS": 3,
     "MARKET_CAPS": {},
     "MARKET_CAP_FX_RATES": {},
+    "MOMENTUM_TICKER_SETTINGS": {},
 }
+
+DEFAULT_MOMENTUM_INDICATOR = "EMA50"
+
+
+def _momentum_setting_for(config: Dict[str, Any], ticker: str) -> Dict[str, Any]:
+    ticker_u = str(ticker or "").strip().upper()
+    if not ticker_u:
+        return {}
+
+    settings = config.get("MOMENTUM_TICKER_SETTINGS") or config.get("momentum_ticker_settings") or {}
+    setting = settings.get(ticker_u) if isinstance(settings, dict) else None
+    out = dict(setting) if isinstance(setting, dict) else {}
+
+    signal_map = config.get("MOMENTUM_SIGNAL_TICKERS") or config.get("momentum_signal_tickers") or {}
+    if isinstance(signal_map, dict) and signal_map.get(ticker_u):
+        out["signal_ticker"] = signal_map.get(ticker_u)
+
+    indicator_map = config.get("MOMENTUM_INDICATORS") or config.get("momentum_indicators") or {}
+    if isinstance(indicator_map, dict) and indicator_map.get(ticker_u):
+        out["indicator"] = indicator_map.get(ticker_u)
+
+    return out
+
+
+def parse_momentum_ticker_entry(entry: Any, setting: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """解析动量标的配置：AAPL、AAPL:EMA50，或外部 setting 覆盖。"""
+    raw = str(entry or "").strip().upper()
+    ticker, _, indicator_raw = raw.partition(":")
+    ticker = ticker.strip()
+    indicator_raw = indicator_raw.strip()
+    setting = setting if isinstance(setting, dict) else {}
+    signal_ticker = str(
+        setting.get("signal_ticker")
+        or setting.get("observe_ticker")
+        or setting.get("benchmark_ticker")
+        or ticker
+    ).strip().upper()
+
+    indicator_override = (
+        setting.get("indicator")
+        or setting.get("trend_indicator")
+        or setting.get("ema")
+    )
+    if indicator_override:
+        indicator_raw = str(indicator_override).strip().upper()
+
+    default_window = int(DEFAULT_MOMENTUM_INDICATOR.replace("EMA", ""))
+    window = default_window
+    if indicator_raw:
+        if indicator_raw.startswith("EMA"):
+            indicator_raw = indicator_raw[3:]
+        try:
+            parsed_window = int(indicator_raw)
+            if parsed_window > 0:
+                window = parsed_window
+        except (TypeError, ValueError):
+            window = default_window
+
+    return {
+        "raw": raw,
+        "ticker": ticker,
+        "signal_ticker": signal_ticker or ticker,
+        "indicator": f"EMA{window}",
+        "ema_window": window,
+    }
+
+
+def get_momentum_ticker_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """返回动量配置：交易标的、信号观察标的、趋势指标。"""
+    configs: List[Dict[str, Any]] = []
+    for entry in config.get("tickers") or []:
+        base = parse_momentum_ticker_entry(entry)
+        ticker = base.get("ticker")
+        if not ticker:
+            continue
+        setting = _momentum_setting_for(config, ticker)
+        configs.append(parse_momentum_ticker_entry(entry, setting=setting))
+    return configs
+
+
+def momentum_ticker_symbol(entry: Any) -> str:
+    """取动量配置里的真实行情代码。"""
+    return parse_momentum_ticker_entry(entry).get("ticker", "")
+
+
+def configured_signal_keys(config: Dict[str, Any]) -> Set[str]:
+    """当前配置仍管理的 signals.json 顶层键。"""
+    keys: Set[str] = set()
+
+    for item in str(config.get("us_stocks") or "").split(","):
+        buy_ticker = item.strip().split(":", 1)[0].strip().upper()
+        if buy_ticker:
+            keys.add(buy_ticker)
+
+    for entry in get_momentum_ticker_configs(config):
+        ticker = entry.get("ticker")
+        if ticker:
+            keys.add(ticker.upper())
+
+    raw_rebalance = str(config.get("rebalance") or "VOO").strip()
+    rebalance_ticker = raw_rebalance.split(":", 1)[0].strip().upper() if raw_rebalance else "VOO"
+    if rebalance_ticker:
+        keys.add(rebalance_ticker)
+
+    return keys
 
 # 全局配置缓存，防止重复加载日志刷屏
 _cached_config = None
@@ -208,7 +325,11 @@ def save_signals(signals: Dict[str, Any]):
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-def update_and_save_signals(new_signals: Dict[str, Any], scan_time: Optional[datetime] = None) -> Dict[str, Any]:
+def update_and_save_signals(
+    new_signals: Dict[str, Any],
+    scan_time: Optional[datetime] = None,
+    active_signal_keys: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
     """
     【核心优化】增量更新信号。只覆盖本次扫描成功的标的，
     报错或断网跳过的标的在 JSON 中保持原样，防止信号丢失。
@@ -226,6 +347,17 @@ def update_and_save_signals(new_signals: Dict[str, Any], scan_time: Optional[dat
     valid_new_signals = {k: v for k, v in new_signals.items() if k != "last_update" and isinstance(v, dict) and v.get("signal") != "ERROR"}
     
     current_signals.update(valid_new_signals)
+
+    if active_signal_keys is not None:
+        active_keys = {str(k).upper() for k in active_signal_keys if str(k).strip()}
+        stale_keys = [
+            k for k, v in current_signals.items()
+            if k != "last_update" and isinstance(v, dict) and str(k).upper() not in active_keys
+        ]
+        for key in stale_keys:
+            current_signals.pop(key, None)
+        if stale_keys:
+            logger.info(f"已清理不在当前配置中的旧信号: {', '.join(sorted(stale_keys))}")
     
     # 更新 last_update 字段
     if "last_update" in new_signals:

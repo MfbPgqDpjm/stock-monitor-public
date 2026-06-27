@@ -5,18 +5,22 @@ import time
 import logging
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
 import pytz
 import math
 
-from state_manager import get_data_path
+from state_manager import (
+    get_data_path,
+    load_momentum_state,
+    momentum_ticker_symbol,
+    get_momentum_ticker_configs,
+)
 from position_state import (
     load_position_state,
     save_position_state_atomic,
     get_strategy_state,
     validate_in_position_state_fields,
-    maybe_update_peak_high,
     resolve_peak_high_for_hold,
 )
 
@@ -739,8 +743,8 @@ def check_individual_stock_signal(
         else:
             hist = fetch_with_retry(ticker, period="3y", now_et=now_et, market="US")
         
-        if hist is None or len(hist) < 60:  # 确保至少有足够计算 EMA50 的数据
-            result["error"] = f"{ticker} 数据量不足 (需 60, 实有 {len(hist) if hist is not None else 0})"
+        if hist is None or len(hist) == 0:
+            result["error"] = f"{ticker} 数据缺失"
             return result
 
         # 3. 应用截断逻辑并提取收盘价
@@ -752,8 +756,12 @@ def check_individual_stock_signal(
             return result
 
         # 检查数据长度是否足够计算
-        if len(stock_close) < max(60, hhv_period + 3):  # 需要至少 hhv_period + 3 天数据计算 HHV20_{t-2}
-            result["error"] = f"{ticker} 数据长度不足，无法计算完整指标"
+        min_required_rows = max(hhv_period + 3, 6)  # HHV_{t-2} 需要 hhv_period + 3；5日前收盘价需要 6
+        if len(stock_close) < min_required_rows:
+            result["error"] = (
+                f"{ticker} 数据长度不足，无法计算完整指标 "
+                f"(需 {min_required_rows}, 实有 {len(stock_close)})"
+            )
             return result
 
         # 确定最终交易日期
@@ -1107,111 +1115,6 @@ def parse_market_configs(config_str: str) -> List[dict]:
             })
     return configs
 
-
-def _madbull_parse_gain_pct(token: str) -> Optional[float]:
-    """单日涨幅阈值（百分点），如 2% 或 2 -> 2.0。"""
-    if not token or not str(token).strip():
-        return None
-    t = str(token).strip()
-    if t.endswith("%"):
-        try:
-            return float(t[:-1].strip())
-        except ValueError:
-            return None
-    try:
-        return float(t)
-    except ValueError:
-        return None
-
-
-def _madbull_parse_drawdown_ratio(token: str) -> Optional[float]:
-    """峰值回撤比例：3% -> 0.03；纯小数 0.03 亦可。"""
-    if not token or not str(token).strip():
-        return None
-    t = str(token).strip()
-    if t.endswith("%"):
-        try:
-            return float(t[:-1].strip()) / 100.0
-        except ValueError:
-            return None
-    try:
-        x = float(t)
-        if 0 < x < 1:
-            return x
-        if x >= 1:
-            return x / 100.0
-    except ValueError:
-        pass
-    return None
-
-
-def _infer_madbull_market(real_ticker: str, config: dict) -> str:
-    """根据代码后缀及配置推断疯牛交易标的市场。"""
-    u = real_ticker.strip().upper()
-    if u.endswith(".SZ") or u.endswith(".SH") or u.endswith(".BJ"):
-        return "CN"
-    for mc in parse_market_configs(config.get("us_stocks", "")):
-        if mc["buy_ticker"] == u:
-            return "US"
-    for t in config.get("tickers", []):
-        if t.strip().upper() == u:
-            return "US"
-    return "CN"
-
-
-def parse_madbulls_config(config_str: str) -> List[dict]:
-    """
-    新格式（每段逗号分隔，每项冒号分隔）:
-      交易标的:观测标的:涨幅阈值:峰值回撤阈值
-      例: MAD.159915.SZ:159915.SZ:2%:3%
-    兼容: 仅一段 MAD.X（涨幅默认 3.6）；两段 MAD.X:3.6（第二段为数字=旧涨幅阈值，观测=交易标的，无峰值回撤）。
-    """
-    configs = []
-    if not config_str:
-        return configs
-    for item in config_str.split(","):
-        parts = [p.strip() for p in item.strip().split(":")]
-        if not parts or not parts[0]:
-            continue
-        ticker = parts[0].upper()
-        real_ticker = ticker.replace("MAD.", "")
-        if real_ticker.startswith("MAD"):
-            real_ticker = real_ticker[3:]
-
-        benchmark = real_ticker.upper()
-        threshold = 3.6
-        drawdown_pct: Optional[float] = None
-
-        if len(parts) >= 4:
-            benchmark = parts[1].upper()
-            g = _madbull_parse_gain_pct(parts[2])
-            if g is not None:
-                threshold = g
-            ddraw = _madbull_parse_drawdown_ratio(parts[3])
-            if ddraw is not None and 0 < ddraw < 1:
-                drawdown_pct = ddraw
-        elif len(parts) == 2:
-            g = _madbull_parse_gain_pct(parts[1])
-            if g is not None:
-                threshold = g
-            else:
-                benchmark = parts[1].upper()
-        elif len(parts) == 3:
-            benchmark = parts[1].upper()
-            g = _madbull_parse_gain_pct(parts[2])
-            if g is not None:
-                threshold = g
-
-        configs.append({
-            "ticker": ticker,
-            "real_ticker": real_ticker.upper(),
-            "benchmark": benchmark,
-            "threshold": threshold,
-            "drawdown_pct": drawdown_pct,
-        })
-    return configs
-
-
 def parse_rebalance_config(config: dict) -> Tuple[str, str]:
     """再平衡：交易标的:观测标的；单独代码则观测=交易。例 VOO:VOO、VOO。"""
     raw = str(config.get("rebalance") or "VOO").strip()
@@ -1314,242 +1217,6 @@ def enrich_rebalance_signal(
         out["trading_close"] = out.get("close")
     return out
 
-def check_madbull_signal(
-    ticker: str,
-    threshold: float,
-    now_et: Optional[datetime],
-    market: str = "CN",
-    data_cache: dict = None,
-    benchmark: Optional[str] = None,
-    drawdown_pct: Optional[float] = None,
-    position_state: Optional[Dict[str, Any]] = None,
-    position_state_key: Optional[str] = None,
-) -> dict:
-    """
-    疯牛策略：
-    空仓：买入 = 观测标的单日涨幅 ≥ threshold%；卖出 = Close_t < EMA20_{t-1}（观测标的）
-    持仓：卖出 = 上述 EMA 条件 **或**（若配置 drawdown_pct）观测标的相对持仓峰值 High 的回撤 ≥ 阈值。
-    展示用 close / 涨幅 / EMA 均基于观测标的；trading_close 为交易标的（如去掉 MAD. 后的代码）最新收盘，供持仓收益率。
-    position_state_key：position_state.json 中 strategies 的键（如 MAD.159915.SZ）。
-    """
-    if now_et is None:
-        now_et = datetime.now(ET_TIMEZONE)
-
-    premarket = is_premarket_by_market(now_et, market)
-    benchmark_disp = (benchmark or ticker).upper()
-    state_key = (position_state_key or ticker).upper()
-
-    result: Dict[str, Any] = {
-        "ticker": ticker,
-        "strategy": "疯牛策略",
-        "market": "A股" if market == "CN" else "美股",
-        "signal": "观望",
-        "close": None,
-        "trading_close": None,
-        "ema20": None,
-        "daily_gain": None,
-        "threshold": threshold,
-        "scan_mode": "未收盘" if premarket else "已收盘",
-        "data_date": "-",
-        "error": None,
-        "benchmark": benchmark_disp,
-        "drawdown_pct": drawdown_pct,
-        "in_position": None,
-        "entry_date": None,
-        "peak_high": None,
-        "peak_date": None,
-        "drawdown": None,
-        "sell_reason": None,
-        "position_state_updated": False,
-    }
-
-    try:
-        if ticker.strip().upper() != benchmark_disp:
-            logger.info(
-                f"疯牛 {state_key}: 观测={benchmark_disp}，交易数据={ticker.strip().upper()}，"
-                "涨幅/EMA/展示价基于观测标的；trading_close 为交易标的。"
-            )
-
-        if data_cache and benchmark_disp in data_cache:
-            hist_bm = data_cache[benchmark_disp]
-        else:
-            hist_bm = fetch_with_retry(benchmark_disp, period="3y", now_et=now_et, market=market)
-
-        if hist_bm is None or len(hist_bm) < 30:
-            result["error"] = (
-                f"{benchmark_disp} 观测数据量不足 (需 30, 实有 {len(hist_bm) if hist_bm is not None else 0})"
-            )
-            return result
-
-        stock_close_raw = hist_bm["Close"].squeeze()
-        stock_close = _apply_time_slice(stock_close_raw, now_et, market=market)
-
-        if stock_close.empty:
-            result["error"] = f"{benchmark_disp} 时间分片后无数据"
-            return result
-
-        if len(stock_close) < 21:
-            result["error"] = f"{benchmark_disp} 数据长度不足，无法计算完整指标"
-            return result
-
-        last_ts = stock_close.index[-1]
-        last_data_date = str(last_ts.date())
-
-        close_series = stock_close
-        ema20 = close_series.ewm(span=20, adjust=False).mean()
-
-        c_t = float(close_series.iloc[-1])
-        ema20_t1 = float(ema20.iloc[-2])
-        c_t1 = float(close_series.iloc[-2])
-        daily_gain = ((c_t - c_t1) / c_t1) * 100
-
-        ps = position_state if isinstance(position_state, dict) else {}
-        st = get_strategy_state(ps, state_key, benchmark_disp, market, create_if_missing=False)
-        if not isinstance(st, dict):
-            st = {}
-        in_position = bool(st.get("in_position"))
-        result["in_position"] = in_position
-        result["entry_date"] = st.get("entry_date")
-        result["peak_high"] = st.get("peak_high")
-        result["peak_date"] = st.get("peak_date")
-
-        ema_sell = c_t < ema20_t1
-        position_state_updated = False
-        dd_sell = False
-        drawdown_val: Optional[float] = None
-        sell_reasons: List[str] = []
-
-        if in_position:
-            if drawdown_pct is not None and 0 < float(drawdown_pct) < 1:
-                if not data_cache or benchmark_disp not in data_cache:
-                    result["signal"] = "ERROR"
-                    result["error"] = f"{ticker} 持仓回撤需要观测标的 {benchmark_disp} 数据"
-                    return result
-
-                bm_data = data_cache[benchmark_disp]
-                close_raw = bm_data["Close"].squeeze()
-                close_bm = _apply_time_slice(close_raw, now_et, market=market)
-                high_raw = bm_data["High"].squeeze()
-                high_bm = _apply_time_slice(high_raw, now_et, market=market)
-                high_bm = high_bm.loc[close_bm.index]
-
-                ok, err = validate_in_position_state_fields(st)
-                if not ok:
-                    result["signal"] = "ERROR"
-                    result["error"] = f"{state_key} 持仓状态无效：{err}（请编辑 position_state.json）"
-                    return result
-
-                entry_date = str(st.get("entry_date"))
-                available_dates = set(idx.strftime("%Y-%m-%d") for idx in close_bm.index)
-                if entry_date not in available_dates:
-                    result["signal"] = "ERROR"
-                    result["error"] = (
-                        f"{state_key} entry_date={entry_date} 不在 {benchmark_disp} 数据中。"
-                        f"请将 entry_date 调整为数据内的 YYYY-MM-DD。"
-                    )
-                    return result
-
-                peak_high, peak_from_entry = resolve_peak_high_for_hold(st)
-                if peak_high is None:
-                    result["signal"] = "ERROR"
-                    result["error"] = f"{state_key} 无法解析 peak_high/entry_price"
-                    return result
-                if peak_from_entry:
-                    st["peak_high"] = peak_high
-                    st["peak_date"] = st.get("peak_date") or entry_date
-                    position_state_updated = True
-
-                high_t = float(high_bm.iloc[-1]) if not high_bm.empty else None
-
-                if high_t is not None:
-                    entry_ts = pd.to_datetime(entry_date)
-                    highs_since_entry = high_bm.loc[high_bm.index >= entry_ts]
-                    if highs_since_entry.empty:
-                        result["signal"] = "ERROR"
-                        result["error"] = (
-                            f"{state_key} entry_date={entry_date} 之后无 {benchmark_disp} High 数据"
-                        )
-                        return result
-
-                    max_high = float(highs_since_entry.max())
-                    max_high_date = str(highs_since_entry.idxmax().date())
-
-                    if max_high > peak_high:
-                        st["peak_high"] = max_high
-                        st["peak_date"] = max_high_date
-                        position_state_updated = True
-
-                    peak_high = float(st.get("peak_high"))
-
-                c_bm = float(close_bm.iloc[-1])
-                drawdown_val = (peak_high - c_bm) / peak_high if peak_high > 0 else None
-                result["peak_high"] = peak_high
-                result["peak_date"] = st.get("peak_date")
-                result["drawdown"] = drawdown_val
-
-                if drawdown_val is not None and drawdown_val >= float(drawdown_pct):
-                    dd_sell = True
-                    sell_reasons.append("drawdown")
-
-            if ema_sell:
-                sell_reasons.append("ema_break")
-
-            if dd_sell or ema_sell:
-                signal = "卖出"
-            else:
-                signal = "观望"
-        else:
-            if daily_gain >= threshold:
-                signal = "买入"
-            elif ema_sell:
-                signal = "卖出"
-                sell_reasons.append("ema_break")
-            else:
-                signal = "观望"
-
-        if position_state_updated:
-            result["position_state_updated"] = True
-
-        tc_trade: Optional[float] = None
-        tku = ticker.strip().upper()
-        if data_cache and tku in data_cache:
-            try:
-                tr_raw = data_cache[tku]["Close"].squeeze()
-                tr_s = _apply_time_slice(tr_raw, now_et, market=market)
-                if tr_s is not None and not tr_s.empty:
-                    tc_trade = float(tr_s.iloc[-1])
-            except Exception:
-                pass
-        if tc_trade is None and tku != benchmark_disp:
-            try:
-                th = fetch_with_retry(ticker, period="3y", now_et=now_et, market=market)
-                if th is not None and len(th) > 0:
-                    tr_raw = th["Close"].squeeze()
-                    tr_s = _apply_time_slice(tr_raw, now_et, market=market)
-                    if tr_s is not None and not tr_s.empty:
-                        tc_trade = float(tr_s.iloc[-1])
-            except Exception:
-                pass
-
-        result.update({
-            "signal": signal,
-            "close": c_t,
-            "trading_close": tc_trade,
-            "close_prev": c_t1,
-            "ema20_prev": ema20_t1,
-            "daily_gain": daily_gain,
-            "data_date": last_data_date,
-            "error": None,
-            "benchmark": benchmark_disp,
-            "sell_reason": ",".join(sell_reasons) if sell_reasons else None,
-        })
-
-    except Exception as e:
-        result["error"] = str(e)
-        logger.error(f"Error in check_madbull_signal for {ticker}: {e}", exc_info=True)
-
-    return result
-
 def run_full_scan(config: dict, now_et: Optional[datetime] = None) -> tuple:
     signals = {}
     if now_et is None: 
@@ -1569,8 +1236,14 @@ def run_full_scan(config: dict, now_et: Optional[datetime] = None) -> tuple:
         all_tickers.append(mc["buy_ticker"])
         all_tickers.append(mc["benchmark"])
 
-    # 2. 个股策略标的
-    all_tickers.extend([t.strip().upper() for t in config.get("tickers", [])])
+    # 2. 个股动量标的：交易标的 + 信号观察标的
+    for ticker_cfg in get_momentum_ticker_configs(config):
+        ticker = ticker_cfg.get("ticker")
+        signal_ticker = ticker_cfg.get("signal_ticker")
+        if ticker:
+            all_tickers.append(ticker)
+        if signal_ticker and signal_ticker != ticker:
+            all_tickers.append(signal_ticker)
     
     # 3. 再平衡策略标的（交易 + 观测，可不同）
     reb_trade, reb_observe = parse_rebalance_config(config)
@@ -1578,13 +1251,23 @@ def run_full_scan(config: dict, now_et: Optional[datetime] = None) -> tuple:
     if reb_observe != reb_trade:
         all_tickers.append(reb_observe)
     
-    # 4. 疯牛策略标的（交易标的 + 观测标的）
-    for mc in parse_madbulls_config(config.get("madbulls", "")):
-        all_tickers.append(mc["real_ticker"])
-        all_tickers.append(mc["benchmark"])
-
-    # 5. 基准标的
+    # 4. 基准标的
     all_tickers.extend(["QQQ", "VOO"])
+
+    # 5. 当前手动持仓也必须进入本轮缓存。部分持仓（如 VUAA.L）不一定在配置扫描名单里，
+    # 但动量持仓审计和持仓监控仍需要它们的历史行情。
+    try:
+        momentum_state = load_momentum_state()
+        current_positions = momentum_state.get("current_positions", [])
+        if isinstance(current_positions, list):
+            for pos in current_positions:
+                if not isinstance(pos, dict):
+                    continue
+                ticker = momentum_ticker_symbol(pos.get("ticker"))
+                if ticker:
+                    all_tickers.append(ticker)
+    except Exception as exc:
+        logger.warning(f"[SCAN] 加载动量持仓标的失败，跳过持仓补充缓存: {exc}")
     
     # 批量获取所有数据
     data_cache = batch_get_data(all_tickers, now_et=now_et)
@@ -1592,58 +1275,6 @@ def run_full_scan(config: dict, now_et: Optional[datetime] = None) -> tuple:
     # 加载持仓状态（由用户手动维护 in_position/entry_date；程序仅在持仓时更新 peak_high/peak_date）
     position_state = load_position_state()
     position_state_dirty = False
-    
-    # --- [疯牛策略数据完整性检测] ---
-    # 在预处理之前检测疯牛策略标的的数据完整性，不完整则重新下载
-    tickers_to_reload = []
-    for mc in parse_madbulls_config(config.get("madbulls", "")):
-        real_ticker = mc["real_ticker"]
-        data = data_cache.get(real_ticker)
-        
-        if data is not None and not data.empty:
-            latest_date = data.index[-1].date() if hasattr(data, 'index') else None
-            
-            if latest_date:
-                # 判断市场状态（A股时间）
-                now_bj = now_et.astimezone(pytz.timezone('Asia/Shanghai'))
-                current_date = now_bj.date()
-                
-                # 判断当前时段
-                is_before_market = now_bj.hour < 9 or (now_bj.hour == 9 and now_bj.minute < 30)
-                is_trading_hour = ((now_bj.hour == 9 and now_bj.minute >= 30) or 
-                                  (10 <= now_bj.hour < 15) or
-                                  (now_bj.hour == 15 and now_bj.minute == 0))
-                is_after_market = now_bj.hour > 15 or (now_bj.hour == 15 and now_bj.minute > 0)
-                
-                # 根据时段确定期望日期
-                if is_before_market:
-                    expected_date = current_date - timedelta(days=1)
-                else:
-                    expected_date = current_date
-                
-                # 检查数据完整性
-                if latest_date < expected_date:
-                    logger.warning(f"⚠️ 疯牛策略标的 {real_ticker} 数据不完整！最新日期({latest_date})落后于期望日期({expected_date})")
-                    tickers_to_reload.append(real_ticker)
-    
-    # 如果有需要重新下载的标的
-    if tickers_to_reload:
-        logger.info(f"尝试重新下载 {len(tickers_to_reload)} 个疯牛策略标的数据...")
-        reload_result = batch_get_data(tickers_to_reload, period="3y", now_et=now_et, force_reload=tickers_to_reload)
-        
-        ok_reload: List[str] = []
-        for ticker in tickers_to_reload:
-            if ticker in reload_result and reload_result[ticker] is not None and not reload_result[ticker].empty:
-                data_cache[ticker] = reload_result[ticker]
-                ok_reload.append(ticker)
-        miss_reload = [t for t in tickers_to_reload if t not in ok_reload]
-        if ok_reload:
-            logger.info(f"疯牛标的重新下载成功 {len(ok_reload)}/{len(tickers_to_reload)} 只")
-        if miss_reload:
-            logger.warning(
-                f"疯牛标的重新下载仍失败 {len(miss_reload)} 只: {', '.join(miss_reload[:30])}"
-                f"{'…' if len(miss_reload) > 30 else ''}"
-            )
     
     # 预处理数据，统一计算指标
     data_cache = preprocess_data(data_cache, now_et=now_et)
@@ -1692,7 +1323,9 @@ def run_full_scan(config: dict, now_et: Optional[datetime] = None) -> tuple:
     # 3. 个股策略 - 【增加错误过滤】
     hhv_period = int(config.get("hhv_period", 20))
     for t in config.get("tickers", []):
-        ticker_symbol = t.strip().upper()
+        ticker_symbol = momentum_ticker_symbol(t)
+        if not ticker_symbol:
+            continue
         
         # 检查数据是否存在
         if ticker_symbol not in data_cache:
@@ -1729,37 +1362,6 @@ def run_full_scan(config: dict, now_et: Optional[datetime] = None) -> tuple:
     signals[rb_trade] = enrich_rebalance_signal(
         rb_base, rb_observe, rb_trade, now_et, data_cache
     )
-
-    # 5. 疯牛策略（可能更新 position_state 峰值，须在落盘前执行）
-    for mc in parse_madbulls_config(config.get("madbulls", "")):
-        ticker = mc["ticker"]
-        real_ticker = mc["real_ticker"]
-        market = _infer_madbull_market(real_ticker, config)
-
-        if real_ticker not in data_cache:
-            if ticker in signals:
-                logger.warning(f"⚠️ 疯牛策略标的 {real_ticker} 数据获取失败或不完整")
-                res = signals[ticker].copy()
-                res["benchmark"] = "⚠️ 数据尚未更新"
-                signals[ticker] = res
-            continue
-
-        res = check_madbull_signal(
-            real_ticker,
-            mc["threshold"],
-            now_et,
-            market,
-            data_cache,
-            benchmark=mc.get("benchmark", real_ticker),
-            drawdown_pct=mc.get("drawdown_pct"),
-            position_state=position_state,
-            position_state_key=mc["ticker"],
-        )
-        res["is_market"] = True
-        signals[ticker] = res
-
-        if res.get("position_state_updated"):
-            position_state_dirty = True
 
     if position_state_dirty:
         save_position_state_atomic(position_state)

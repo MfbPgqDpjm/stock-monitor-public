@@ -30,6 +30,7 @@ def _default_strategy_state(buy_ticker: str, benchmark: str, market: str) -> Dic
         "benchmark": benchmark,
         "market": market,
         "in_position": False,
+        "signal_date": None,
         "entry_date": None,
         "entry_price": None,
         "peak_high": None,
@@ -165,6 +166,7 @@ def get_strategy_state(
         s.setdefault("benchmark", benchmark)
         s.setdefault("market", market)
         s.setdefault("in_position", False)
+        s.setdefault("signal_date", None)
         s.setdefault("entry_date", None)
         s.setdefault("entry_price", None)
         s.setdefault("peak_high", None)
@@ -235,4 +237,3 @@ def maybe_update_peak_high(
         return True
 
     return False
-

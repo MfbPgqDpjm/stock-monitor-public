@@ -38,14 +38,30 @@ except ImportError:
 
 from strategy import (
     parse_market_configs,
-    parse_madbulls_config,
     parse_rebalance_config,
     run_full_scan,
 )
 from position_manager import process_trade
 from utils import get_signals_timestamp
-from position_state import load_position_state
-from ytd_performance import load_ytd_snapshot, refresh_ytd_performance
+from ytd_performance import get_ytd_config, get_ytd_performance, refresh_ytd_performance
+from macro_cycle_dashboard import get_macro_cycle_dashboard
+from market_sentiment import (
+    get_cnn_fear_greed_metric,
+    get_vix_metric,
+    write_market_sentiment_diagnostic,
+)
+from futu_quote_provider import fetch_futu_realtime_quotes
+from holding_monitor import (
+    build_holding_monitor_rows,
+    collect_holding_tickers,
+    holding_monitor_source_suffix,
+)
+from momentum_view import (
+    MOMENTUM_DECISION_COLUMNS,
+    PENDING_OPERATION_COLUMNS,
+    build_momentum_decision_view,
+    build_pending_operations,
+)
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -79,10 +95,8 @@ def trade_dialog():
     # 价格输入
     price = st.number_input("交易价格", min_value=0.01, step=0.01, format="%.2f", key="dialog_price")
     
-    # 数量输入（买入时需要）
-    quantity = 1
-    if trade_type == "买入":
-        quantity = st.number_input("数量（股）", min_value=1, step=1, key="dialog_quantity")
+    # 数量写入状态文件；执行日志和页面历史只展示单价
+    quantity = st.number_input("数量（股）", min_value=0.000001, step=1.0, format="%.6f", key="dialog_quantity")
     
     # 日期选择
     trade_date = st.date_input("交易日期", value=date.today(), key="dialog_date")
@@ -120,18 +134,6 @@ def trade_dialog():
             st.rerun()
         else:
             st.error(message)
-
-def _fmt_position_pnl(entry_price: object, trading_close: object) -> str:
-    """持仓收益率：基于手动 entry_price 与信号中 trading_close（交易标的）。"""
-    try:
-        ep = float(entry_price)
-        tc = float(trading_close)
-        if ep <= 0:
-            return "—"
-        return f"{(tc - ep) / ep * 100:+.2f}%"
-    except (TypeError, ValueError):
-        return "—"
-
 
 def _mark_bool(ok: bool) -> str:
     return "✅" if ok else "❌"
@@ -177,40 +179,119 @@ def _is_finite_num(value: object) -> bool:
         return False
 
 
-def _render_ytd_progress_capsule(name: str, ytd_pct: float, meta: str = "") -> None:
+def _render_ytd_progress_capsule(name: str, ytd_pct: float, daily_pct: object = None) -> None:
     color = "#2e7d32" if ytd_pct >= 0 else "#d32f2f"
     sign = "+" if ytd_pct > 0 else ""
     fill_percent = min(abs(ytd_pct), 100.0)
     safe_name = html.escape(str(name))
-    safe_meta = html.escape(str(meta)) if meta else ""
+    daily_html = ""
+    if _is_finite_num(daily_pct):
+        daily_value = float(daily_pct)
+        daily_color = "#2e7d32" if daily_value >= 0 else "#d32f2f"
+        daily_sign = "+" if daily_value > 0 else ""
+        daily_html = (
+            f'<span style="color:{daily_color};font-weight:700;'
+            f'font-variant-numeric:tabular-nums;">({daily_sign}{daily_value:.2f}%)</span>'
+        )
 
     html_code = (
         '<div style="display:flex;align-items:center;margin-bottom:10px;width:100%;max-width:760px;">'
-        f'<div style="width:86px;font-weight:650;white-space:nowrap;">{safe_name}</div>'
+        f'<div style="width:60px;font-weight:650;white-space:nowrap;">{safe_name}</div>'
         '<div style="flex:1;background-color:#f1f3f4;height:16px;display:flex;'
         'justify-content:flex-start;border-radius:10px;overflow:hidden;position:relative;">'
         f'<div style="width:{fill_percent:.1f}%;background-color:{color};height:16px;border-radius:0;"></div>'
         '</div>'
         f'<div style="width:82px;text-align:right;font-weight:800;color:{color};margin-left:10px;'
         f'font-variant-numeric:tabular-nums;">{sign}{ytd_pct:.2f}%</div>'
-        f'<div style="width:72px;color:#777;font-size:12px;margin-left:8px;white-space:nowrap;">{safe_meta}</div>'
+        f'<div style="width:72px;font-size:12px;margin-left:8px;white-space:nowrap;">{daily_html}</div>'
         '</div>'
     )
     st.markdown(html_code, unsafe_allow_html=True)
 
 
-def _is_current_ytd_snapshot(snapshot: dict) -> bool:
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_market_sentiment_metrics(cache_version: int = 6) -> dict:
+    return {
+        "vix": get_vix_metric(),
+        "fear_greed": get_cnn_fear_greed_metric(),
+    }
+
+
+def _format_metric_delta(delta: object, delta_pct: object = None, suffix: str = "") -> str | None:
+    if not _is_finite_num(delta):
+        return None
+    sign = "+" if float(delta) > 0 else ""
+    if _is_finite_num(delta_pct):
+        return f"{sign}{float(delta):.2f}{suffix} ({sign}{float(delta_pct):.2f}%)"
+    return f"{sign}{float(delta):.2f}{suffix}"
+
+
+def _fear_greed_delta_pct(metric: dict) -> float | None:
+    if _is_finite_num(metric.get("delta_pct")):
+        return float(metric["delta_pct"])
+    score = metric.get("score")
+    delta = metric.get("delta")
+    if not (_is_finite_num(score) and _is_finite_num(delta)):
+        return None
+    previous = float(score) - float(delta)
+    if previous == 0:
+        return None
+    return (float(score) / previous - 1.0) * 100.0
+
+
+def _render_market_sentiment_metrics() -> None:
+    metrics = _load_market_sentiment_metrics(cache_version=6)
+    vix = metrics.get("vix") if isinstance(metrics, dict) else {}
+    fear_greed = metrics.get("fear_greed") if isinstance(metrics, dict) else {}
+
+    col_vix, col_fear = st.columns(2)
+    with col_vix:
+        value = vix.get("value") if isinstance(vix, dict) else None
+        st.metric(
+            label=".VIX 标普500波动率指数",
+            value=f"{float(value):.2f}" if _is_finite_num(value) else "N/A",
+            delta=_format_metric_delta(
+                vix.get("delta"),
+                vix.get("delta_pct"),
+            ) if isinstance(vix, dict) else None,
+            delta_color="inverse",
+        )
+    with col_fear:
+        score = fear_greed.get("score") if isinstance(fear_greed, dict) else None
+        rating = fear_greed.get("rating", "") if isinstance(fear_greed, dict) else ""
+        if not _is_finite_num(score):
+            message = f"[市场情绪] CNN Fear & Greed UI 将显示 N/A: metric={fear_greed}"
+            logger.error(message)
+            write_market_sentiment_diagnostic("ERROR", message)
+        rating_suffix = f" {rating.title()}" if rating else ""
+        st.metric(
+            label="CNN Fear & Greed Index",
+            value=f"{float(score):.0f}{rating_suffix}" if _is_finite_num(score) else "N/A",
+            delta=_format_metric_delta(_fear_greed_delta_pct(fear_greed), suffix="%") if isinstance(fear_greed, dict) else None,
+        )
+
+
+def _is_current_ytd_snapshot(snapshot: dict, config: dict) -> bool:
     rows = snapshot.get("targets") if isinstance(snapshot, dict) else None
     if not isinstance(rows, list):
         return False
 
-    expected_names = {"AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "QQQ", "VOO", "TQQQ", "KOSPI"}
-    row_names = {str(row.get("name", "")).upper() for row in rows if isinstance(row, dict)}
-    return row_names == expected_names
+    expected_tickers = get_ytd_config(config)["tickers"]
+    snapshot_tickers = snapshot.get("configured_tickers")
+    if not isinstance(snapshot_tickers, list):
+        snapshot_tickers = [
+            str(row.get("ticker", "")).strip().upper()
+            for row in rows
+            if isinstance(row, dict) and row.get("ticker")
+        ]
+    has_daily_schema = all(isinstance(row, dict) and "daily_pct" in row for row in rows)
+    return snapshot_tickers == expected_tickers and has_daily_schema
 
 
 def _render_ytd_capsules(snapshot: dict) -> None:
-    """APP.py 页面展示：MAGA8/QQQ/VOO/TQQQ/KOSPI YTD 胶囊进度条。"""
+    """APP.py 页面展示：MAGA8/QQQ/VOO/TQQQ/SPCX/.KOSPI/VUAA YTD 胶囊进度条。"""
+    _render_market_sentiment_metrics()
+
     rows = snapshot.get("targets") if isinstance(snapshot, dict) else None
     if not rows:
         st.info("YTD 涨幅暂无数据，请点击「立即扫描」更新。")
@@ -239,13 +320,29 @@ def _render_ytd_capsules(snapshot: dict) -> None:
     for row in valid_rows:
         name = str(row.get("name", ""))
         ytd_pct = float(row.get("ytd_pct", 0.0))
-        meta = ""
-        if row.get("latest_date"):
-            meta = str(row["latest_date"])
-        _render_ytd_progress_capsule(name, ytd_pct, meta)
+        _render_ytd_progress_capsule(name, ytd_pct, row.get("daily_pct"))
 
 
-# 一眼执行表格 [实时信号] — 美股大盘/再平衡/疯牛 展示列（不含内部排序列）
+def _render_macro_cycle_dashboard(snapshot: dict) -> None:
+    """只展示 macro_cycle_dashboard.py 计算后的宏观周期诊断结果。"""
+    if not isinstance(snapshot, dict) or not snapshot.get("signals"):
+        err = snapshot.get("refresh_error") if isinstance(snapshot, dict) else ""
+        st.warning(f"宏观周期诊断暂无数据{f'：{err}' if err else ''}")
+        return
+
+    if snapshot.get("refresh_error"):
+        st.warning(f"刷新失败，当前展示最近一次快照：{snapshot['refresh_error']}")
+
+    conclusion = snapshot.get("conclusion", "—")
+    action = snapshot.get("action", "—")
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        st.info(f"当前定位：{conclusion}")
+    with col_m2:
+        st.info(f"操作含义：{action}")
+
+
+# 一眼执行表格 [实时信号] — 美股大盘/再平衡 展示列（不含内部排序列）
 MARKET_SIGNAL_TABLE_COLS = [
     "策略类型",
     "市场",
@@ -257,6 +354,16 @@ MARKET_SIGNAL_TABLE_COLS = [
     "信号情况",
     "数据模式",
 ]
+
+
+def _signal_generated_date(signal: str, data_date: object, actionable_signals: set[str]) -> str:
+    """Only show a market data date when the row has produced an actionable signal."""
+    return str(data_date or "—") if signal in actionable_signals else "—"
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _load_futu_quotes_cached(tickers: tuple[str, ...], host: str, port: int) -> dict:
+    return fetch_futu_realtime_quotes(tickers, host=host, port=port)
 
 
 def render_dashboard():
@@ -300,7 +407,7 @@ def render_dashboard():
     
     # 首先尝试加载保存的动量结果
     try:
-        from momentum_scorer import MomentumScorer, format_rs_pct
+        from momentum_scorer import MomentumScorer
         # 加载信号数据，避免重复扫描
         signals = load_signals()
         # 移除 last_update 字段
@@ -382,7 +489,7 @@ def render_dashboard():
                     time_diff = (now - last_update).total_seconds()
                     if time_diff < 30:  # 30s内
                         try:
-                            refresh_ytd_performance(now_et=now, force_reload=True)
+                            refresh_ytd_performance(now_et=now, force_reload=True, config=cfg)
                         except Exception as e:
                             logger.error(f"YTD 涨幅更新失败：{e}")
                         st.info(f"距离上次扫描仅 {int(time_diff)} 秒，使用缓存数据")
@@ -411,7 +518,7 @@ def render_dashboard():
                 status_text.text("正在更新 YTD 涨幅...")
                 progress_bar.progress(0.9)
                 try:
-                    refresh_ytd_performance(force_reload=True)
+                    refresh_ytd_performance(force_reload=True, config=cfg)
                 except Exception as e:
                     logger.error(f"YTD 涨幅更新失败：{e}")
                     st.warning("扫描完成，但 YTD 涨幅更新失败，请稍后再试。")
@@ -433,6 +540,7 @@ def render_dashboard():
     # 显示当前观测时间
     current_view_time = get_signals_timestamp()
     st.subheader(f"📊 当前观测坐标: {current_view_time.strftime('%Y-%m-%d %H:%M')} (ET)")
+    _render_macro_cycle_dashboard(get_macro_cycle_dashboard())
 
     # 加载扫描状态
     scan_status = load_scan_status()
@@ -457,13 +565,9 @@ def render_dashboard():
     with col_s3:
         st.info(f"定时扫描已配置: {cfg.get('scan_time', 'ET1630,ET0135')}")
 
-    ytd_snapshot = load_ytd_snapshot()
-    if not _is_current_ytd_snapshot(ytd_snapshot):
-        try:
-            ytd_snapshot = refresh_ytd_performance(now_et=now_et)
-        except Exception as e:
-            logger.error(f"初始化 YTD 涨幅失败：{e}")
-            ytd_snapshot = {}
+    ytd_snapshot = get_ytd_performance(now_et=now_et, config=cfg)
+    if not _is_current_ytd_snapshot(ytd_snapshot, cfg):
+        logger.warning("[YTD] 本地快照与当前配置/格式不一致；请通过「立即扫描」刷新持久缓存。")
     _render_ytd_capsules(ytd_snapshot)
 
     st.divider()
@@ -486,11 +590,16 @@ def render_dashboard():
             "再平衡提醒": "🔔",
         }
 
-        hhv_period_cfg = int(cfg.get("hhv_period", 20))
-        individual_tickers = [t.strip().upper() for t in cfg.get("tickers", []) if t.strip()]
         us_configs = parse_market_configs(cfg.get("us_stocks", ""))
         rebalance_trade, rebalance_observe = parse_rebalance_config(cfg)
         market_tickers_us = [mc["buy_ticker"] for mc in us_configs]
+        realtime_tickers = collect_holding_tickers(us_configs, momentum_result or {})
+        futu_host = str(cfg.get("FUTU_OPEND_HOST") or "127.0.0.1")
+        try:
+            futu_port = int(cfg.get("FUTU_OPEND_PORT") or 11111)
+        except (TypeError, ValueError):
+            futu_port = 11111
+        realtime_quotes = _load_futu_quotes_cached(tuple(sorted(t for t in realtime_tickers if t)), futu_host, futu_port)
 
         st.subheader(f"📋 一眼执行表格 [{signals_label}]")
         rows = []
@@ -498,7 +607,6 @@ def render_dashboard():
         special_tickers = [mc["buy_ticker"] for mc in us_configs]
         special_tickers.append(rebalance_trade)
 
-        madbulls_configs = parse_madbulls_config(cfg.get("madbulls", ""))
         rebalance_data = signals.get(rebalance_trade, {})
 
         # ── 0: 再平衡策略（固定首块）────────────────────────────────────────────
@@ -523,7 +631,11 @@ def render_dashboard():
             signal_situation_rb = (
                 f"提醒窗口内: {_mark_bool(reminder)} | 再平衡提醒: {_mark_bool(in_reminder_signal)}"
             )
-            signal_date_rb = rebalance_data.get("data_date") or "—"
+            signal_date_rb = _signal_generated_date(
+                rebalance_signal,
+                rebalance_data.get("data_date"),
+                {"再平衡提醒"},
+            )
             observe_label_rb = str(rb_bm)
 
             rows.append({
@@ -615,7 +727,7 @@ def render_dashboard():
             in_pos = bool(data.get("in_position"))
             dd = data.get("drawdown")
             if in_pos and isinstance(dd, (int, float)):
-                dd_part = _mark_bool(float(dd) >= float(dd_pct_cfg))
+                dd_part = f"{float(dd) * 100:.2f}% {_mark_bool(float(dd) >= float(dd_pct_cfg))}"
             else:
                 dd_part = "—"
 
@@ -628,7 +740,11 @@ def render_dashboard():
 
             bm = data.get("benchmark", "N/A")
             observe_label = str(bm)
-            signal_date = data.get("data_date") or "—"
+            signal_date = _signal_generated_date(
+                signal,
+                data.get("data_date"),
+                {"买入", "卖出"},
+            )
 
             score_val = data.get("score")
             score_str = f"{float(score_val):.4f}" if isinstance(score_val, (int, float)) else "N/A"
@@ -652,100 +768,16 @@ def render_dashboard():
                 "Score": score_str,
             })
 
-        # ── 2: A股疯牛策略 ───────────────────────────────────────────────────────
-        for j, mc in enumerate(madbulls_configs):
-            madbull_ticker = mc["ticker"]
-            madbull_data = signals.get(madbull_ticker, {})
-            if not madbull_data:
-                continue
-
-            madbull_signal = madbull_data.get("signal", "观望")
-            market = madbull_data.get("market", "A股")
-            is_index = 1
-
-            close_val = madbull_data.get("close", "N/A")
-            currency_symbol = "¥" if market == "A股" else "$"
-            if isinstance(close_val, (int, float)):
-                close_str = f"{currency_symbol}{float(close_val):.2f}"
-            else:
-                close_str = f"{close_val}"
-
-            daily_gain_val = madbull_data.get("daily_gain")
-            ema20_prev_val = madbull_data.get("ema20_prev")
-            gain_cfg = float(mc.get("threshold", madbull_data.get("threshold", 3.6)))
-            dd_cfg = madbull_data.get("drawdown_pct")
-            if dd_cfg is None:
-                dd_cfg = mc.get("drawdown_pct")
-            dd_cur = madbull_data.get("drawdown")
-
-            ki_parts = []
-            if isinstance(ema20_prev_val, (int, float)):
-                ki_parts.append(f"昨日EMA20: {currency_symbol}{float(ema20_prev_val):.2f}")
-            ki_parts.append(f"涨幅阈值: {gain_cfg:g}%")
-            if isinstance(dd_cfg, (int, float)) and 0 < float(dd_cfg) < 1:
-                ki_parts.append(f"回撤止损: {float(dd_cfg) * 100:.0f}%")
-            key_indicators_str = " | ".join(ki_parts) if ki_parts else "N/A"
-
-            gain_ok = isinstance(daily_gain_val, (int, float)) and float(daily_gain_val) >= gain_cfg
-            ema_ok = (
-                isinstance(close_val, (int, float))
-                and isinstance(ema20_prev_val, (int, float))
-                and float(close_val) >= float(ema20_prev_val)
-            )
-            if isinstance(dd_cfg, (int, float)) and 0 < float(dd_cfg) < 1 and isinstance(dd_cur, (int, float)):
-                dd_part = _mark_bool(float(dd_cur) >= float(dd_cfg))
-            else:
-                dd_part = "—"
-
-            gain_pct_str = (
-                f"{float(daily_gain_val):.2f}%"
-                if isinstance(daily_gain_val, (int, float))
-                else "—"
-            )
-            # 与 check_madbull_signal：涨幅 daily_gain>=threshold；EMA 破位为 close<ema20_prev；回撤触发 drawdown>=pct
-            signal_situation_mb = (
-                f"最新单日涨幅: {gain_pct_str} | "
-                f"涨幅达标: {_mark_bool(gain_ok)} | "
-                f"收盘价>=昨日EMA20: {_mark_bool(ema_ok)} | "
-                f"触发回撤止损: {dd_part}"
-            )
-
-            benchmark = madbull_data.get("benchmark", "—")
-            observe_label_mb = str(benchmark)
-            signal_date_mb = madbull_data.get("data_date") or "—"
-
-            rows.append({
-                "策略类型": "A股疯牛策略",
-                "市场": market,
-                "信号": f"{SIGNAL_COLOR.get(madbull_signal, '⚪')} {madbull_signal}",
-                "信号产生日期": signal_date_mb,
-                "观测基准": observe_label_mb,
-                "当前价": close_str,
-                "关键指标": key_indicators_str,
-                "信号情况": signal_situation_mb,
-                "数据模式": madbull_data.get("scan_mode", "N/A"),
-                "标的": madbull_ticker,
-                "_table_block": 2,
-                "_block_order": j,
-                "is_index": is_index,
-                "score": None,
-                "signal_sort": 0 if madbull_signal == "买入" else 1 if madbull_signal == "关注" else 2 if madbull_signal == "卖出" else 3,
-                "Score": "N/A",
-            })
-
         if rows:
             df = pd.DataFrame(rows)
 
-            # 第一个表格：美股大盘、再平衡、疯牛
-            market_strategies = ["美股大盘策略", "再平衡策略", "A股疯牛策略"]
+            # 第一个表格：美股大盘、再平衡
+            market_strategies = ["美股大盘策略", "再平衡策略"]
             df_market = df[df["策略类型"].isin(market_strategies)]
 
-            # 第二个表格：包含美股个股策略
-            df_individual = df[df["策略类型"] == "个股策略"]
-
-            # 显示第一个表格（块顺序：再平衡 → 美股大盘 → A股疯牛）
+            # 显示第一个表格（块顺序：再平衡 → 美股大盘）
             if not df_market.empty:
-                st.markdown("##### 📈 美股大盘 / 再平衡 / 疯牛")
+                st.markdown("##### 📈 美股大盘 / 再平衡")
                 df_market_sorted = df_market.sort_values(
                     by=["_table_block", "_block_order"],
                     ascending=[True, True],
@@ -760,168 +792,57 @@ def render_dashboard():
                     height=calc_height,
                 )
 
-                # ── 大盘策略持仓展示（手动维护） ───────────────────────────────
-                # 位置：紧贴“执行表格”下方，避免被动量模块的持仓面板淹没。
-                try:
-                    pos_state = load_position_state()
-                    strategies = pos_state.get("strategies", {}) if isinstance(pos_state, dict) else {}
-                except Exception:
-                    strategies = {}
-
-                market_positions = []
-                for mc in us_configs:
-                    tkr = mc.get("buy_ticker")
-                    if not tkr:
-                        continue
-
-                    s = strategies.get(tkr, {}) if isinstance(strategies, dict) else {}
-                    in_pos = bool(s.get("in_position")) if isinstance(s, dict) else False
-                    if not in_pos:
-                        continue
-
-                    sig = signals.get(tkr, {}) if isinstance(signals, dict) else {}
-                    bm = (sig.get("benchmark") or s.get("benchmark") or "")
-                    entry_date = s.get("entry_date")
-                    peak_high = s.get("peak_high")
-                    peak_date = s.get("peak_date")
-
-                    latest_close = sig.get("close")
-                    latest_price_str = ""
-                    try:
-                        if isinstance(latest_close, (int, float)):
-                            market_tag = sig.get("market")
-                            currency = "$" if market_tag == "美股" else "¥" if market_tag == "A股" else ""
-                            latest_price_str = f"{currency}{float(latest_close):.2f}" if currency else f"{float(latest_close):.2f}"
-                    except Exception:
-                        latest_price_str = ""
-
-                    dd = sig.get("drawdown")
-                    dd_str = f"{dd*100:.2f}%" if isinstance(dd, (int, float)) else ""
-
-                    sell_reason = sig.get("sell_reason") or ""
-                    status = f"🔴 待卖出 ({sell_reason})" if sig.get("signal") == "卖出" else "🟢 持仓中"
-
-                    entry_price = s.get("entry_price")
-                    pnl_str = _fmt_position_pnl(entry_price, sig.get("trading_close"))
-
-                    peak_str = ""
-                    try:
-                        if peak_high is not None and str(peak_high).strip() not in ("", "None"):
-                            peak_str = f"{float(peak_high):.2f}"
-                    except Exception:
-                        peak_str = str(peak_high) if peak_high is not None else ""
-
-                    mkt = (sig.get("market") or "").strip() or "—"
-                    sig_date = (sig.get("data_date") or "").strip() or "—"
-
-                    market_positions.append({
-                        "交易标的": tkr,
-                        "市场": mkt,
-                        "信号/状态": status,
-                        "信号产生日期": sig_date,
-                        "观测基准": bm,
-                        "峰值High": peak_str,
-                        "峰值日期": peak_date or "",
-                        "当前价": latest_price_str,
-                        "当前回撤": dd_str,
-                        "入场日期": entry_date or "",
-                        "持仓收益": pnl_str,
-                    })
-
-                mad_rows_cfg = parse_madbulls_config(cfg.get("madbulls", ""))
-                for mc in mad_rows_cfg:
-                    rt = mc.get("real_ticker")
-                    mad_key = mc.get("ticker")
-                    if not rt or not mad_key:
-                        continue
-                    mad_key_u = mad_key.upper()
-                    s = strategies.get(mad_key_u, {}) if isinstance(strategies, dict) else {}
-                    if not (isinstance(s, dict) and bool(s.get("in_position"))):
-                        continue
-                    sig = signals.get(mad_key_u, {}) if isinstance(signals, dict) else {}
-                    bm = mc.get("benchmark") or (sig.get("benchmark") or s.get("benchmark") or "")
-                    entry_date = s.get("entry_date")
-                    peak_high = s.get("peak_high")
-                    peak_date = s.get("peak_date")
-
-                    latest_close = sig.get("close")
-                    latest_price_str = ""
-                    try:
-                        if isinstance(latest_close, (int, float)):
-                            market_tag = sig.get("market")
-                            currency = "$" if market_tag == "美股" else "¥" if market_tag == "A股" else ""
-                            latest_price_str = f"{currency}{float(latest_close):.2f}" if currency else f"{float(latest_close):.2f}"
-                    except Exception:
-                        latest_price_str = ""
-
-                    dd = sig.get("drawdown")
-                    dd_str = f"{dd*100:.2f}%" if isinstance(dd, (int, float)) else ""
-
-                    sell_reason = sig.get("sell_reason") or ""
-                    status = f"🔴 待卖出 ({sell_reason})" if sig.get("signal") == "卖出" else "🟢 持仓中"
-
-                    entry_price = s.get("entry_price")
-                    pnl_str = _fmt_position_pnl(entry_price, sig.get("trading_close"))
-
-                    peak_str = ""
-                    try:
-                        if peak_high is not None and str(peak_high).strip() not in ("", "None"):
-                            peak_str = f"{float(peak_high):.2f}"
-                    except Exception:
-                        peak_str = str(peak_high) if peak_high is not None else ""
-
-                    mkt = (sig.get("market") or "").strip() or "—"
-                    sig_date = (sig.get("data_date") or "").strip() or "—"
-
-                    market_positions.append({
-                        "交易标的": mad_key_u,
-                        "市场": mkt,
-                        "信号/状态": status,
-                        "信号产生日期": sig_date,
-                        "观测基准": bm,
-                        "峰值High": peak_str,
-                        "峰值日期": peak_date or "",
-                        "当前价": latest_price_str,
-                        "当前回撤": dd_str,
-                        "入场日期": entry_date or "",
-                        "持仓收益": pnl_str,
-                    })
-
-                if market_positions:
-                    st.markdown("###### 📌 大盘持仓（手动）")
-                    df_pos = pd.DataFrame(market_positions)
-                    df_pos = df_pos[
-                        [
-                            "交易标的",
-                            "市场",
-                            "信号/状态",
-                            "信号产生日期",
-                            "观测基准",
-                            "峰值High",
-                            "峰值日期",
-                            "当前价",
-                            "当前回撤",
-                            "入场日期",
-                            "持仓收益",
-                        ]
-                    ]
-                    st.dataframe(df_pos, width="stretch", hide_index=True)
-            
-            # 显示第二个表格：个股策略
-            # if not df_individual.empty:
-            #     st.subheader("📊 个股策略")
-            #     df_individual_sorted = sort_individual_strategy(df_individual)
-            #     display_columns = [
-            #         "标的", "策略类型", "观测基准", "市场", "信号", "Score",
-            #         "当前价", "关键指标", "达标情况", "数据模式", "备注"
-            #     ]
-            #     # 动态计算高度
-            #     row_count = len(df_individual_sorted)
-            #     calc_height = (row_count * 35) + 37  # 35px 为行高，40px 为表头留白
-            #     # 设置高度上限
-            #     calc_height = min(calc_height, 1000)
-            #     # 应用高度参数，保留use_container_width=True
-            #     st.dataframe(df_individual_sorted[display_columns], width="stretch", hide_index=True, height=calc_height)
+        holding_rows = build_holding_monitor_rows(us_configs, signals, momentum_result or {}, realtime_quotes)
+        st.markdown("##### 📌 持仓监控")
+        if holding_rows:
+            df_holdings = pd.DataFrame(holding_rows)
+            holding_display_columns = [
+                "标的",
+                "持仓收益",
+                "最新价",
+                "持仓状态",
+                "持仓类型",
+                "市场",
+                "买入价",
+                "买入日期",
+                "持仓最高收益",
+                "持仓最大回撤",
+                "指标",
+                "指标线",
+                "持股天数",
+            ]
+            df_holdings = df_holdings.sort_values(
+                by="持仓收益",
+                ascending=False,
+                na_position="last",
+                kind="mergesort",
+            )
+            source_suffix = holding_monitor_source_suffix(holding_rows)
+            latest_price_col = f"最新价（{source_suffix}）"
+            pnl_col = f"持仓收益（{source_suffix}）"
+            df_holdings_display = df_holdings[holding_display_columns].rename(columns={
+                "最新价": latest_price_col,
+                "持仓收益": pnl_col,
+            })
+            row_count = len(df_holdings)
+            calc_height = min((row_count * 35) + 37, 600)
+            st.dataframe(
+                df_holdings_display,
+                width="stretch",
+                hide_index=True,
+                height=calc_height,
+                column_config={
+                    "买入价": st.column_config.NumberColumn(format="%.2f"),
+                    latest_price_col: st.column_config.NumberColumn(format="%.2f"),
+                    pnl_col: st.column_config.NumberColumn(format="%+.2f%%"),
+                    "持仓最高收益": st.column_config.NumberColumn(format="%.2f%%"),
+                    "持仓最大回撤": st.column_config.NumberColumn(format="%.2f%%"),
+                    "指标线": st.column_config.NumberColumn(format="%.2f"),
+                    "持股天数": st.column_config.NumberColumn(format="%d"),
+                },
+            )
+        else:
+            st.info("当前无持仓")
 
         # ── 个股动量系统 ───────────────────────────────────────────────────────────────
         st.divider()
@@ -940,154 +861,52 @@ def render_dashboard():
         st.caption(f"⚙️ 当前配置：美元市值 ≥ ${min_market_cap/1_000_000_000:.1f}B | HHV {hhv_window} | 最多持仓 {max_positions} 只 | 等权")
         
         if momentum_result:
-            # 第一部分：持仓信息面板
-            st.markdown("##### 【第一部分：持仓监控】")
-            
-            position_audit = momentum_result.get("position_audit", {})
-            
-            if position_audit.get("status") == "无持仓":
-                st.info("当前无持仓")
-            elif position_audit.get("status") == "数据获取失败":
-                st.error("数据获取失败，请检查网络连接")
-            else:
-                # 有持仓（支持多持仓）
-                positions = position_audit.get("positions", [])
-                if not isinstance(positions, list):
-                    # 兼容旧格式（单持仓）
-                    positions = [position_audit]
-                
-                rows = []
-                for pos in positions:
-                    bp = pos.get("buy_price", "")
-                    lp = pos.get("latest_price", "")
-                    ema50 = pos.get("ema50", "")
-                    hd = pos.get("hold_days", "")
-                    rows.append({
-                        "标的": pos.get("ticker", ""),
-                        "买入价": f"{float(bp):.2f}" if isinstance(bp, (int, float)) else str(bp or ""),
-                        "买入日期": pos.get("buy_date", ""),
-                        "最新价": f"{float(lp):.2f}" if isinstance(lp, (int, float)) else str(lp or ""),
-                        "EMA50": f"{float(ema50):.2f}" if isinstance(ema50, (int, float)) else str(ema50 or ""),
-                        "最新日期": pos.get("latest_date", ""),
-                        "收益率": f"{pos.get('total_return', 0) * 100:.2f}%" if isinstance(pos.get('total_return'), (int, float)) else "",
-                        "最高收益": f"{pos.get('max_return', 0) * 100:.2f}%" if isinstance(pos.get('max_return'), (int, float)) else "",
-                        "最大回撤": f"{pos.get('max_drawdown', 0) * 100:.2f}%" if isinstance(pos.get('max_drawdown'), (int, float)) else "",
-                        "持股天数": str(hd) if hd not in (None, "") else "",
-                        "持仓状态": f"🔴 等待卖出 ({pos.get('sell_reason', '')})" if pos.get("action_plan") == "待卖出" else "🟢 继续持有"
-                    })
-                df_position = pd.DataFrame(rows)
-                # 动态计算高度
-                row_count = len(df_position)
-                calc_height = (row_count * 35) + 37  # 35px 为行高，40px 为表头留白
-                # 设置高度上限
-                calc_height = min(calc_height, 500)
-                # 应用高度参数，保留use_container_width=True
-                st.dataframe(df_position, width="stretch", hide_index=True, height=calc_height)
-            
-            # 第二部分：RS120 排名和决策信号
-            st.markdown("##### 【第二部分：决策信号】")
-            buy_signal = momentum_result.get("buy_signal", {})
-            
-            scanned_stocks = buy_signal.get("scanned_stocks", [])
-            eligible_stocks = [s for s in scanned_stocks if s.get("eligible")]
-            eligible_stocks.sort(key=lambda s: -(s.get("rs120") or 0))
+            st.markdown("##### 【决策信号】")
+            decision_view = build_momentum_decision_view(momentum_result)
+            if decision_view.get("limited_history"):
+                logger.info(decision_view["limited_history"])
 
-            if not scanned_stocks:
+            if decision_view.get("status") == "no_scan":
                 st.info("暂无扫描数据，请点击「立即扫描」")
-            elif not eligible_stocks:
+            elif decision_view.get("status") == "no_eligible":
                 st.info("无符合买入条件的标的")
             else:
-                st.caption("📈 候选池排名（20日新高突破，按 RS120 从高到低）")
-
-                rows = []
-                for i, stock in enumerate(eligible_stocks):
-                    tags = []
-                    if stock.get("is_position"):
-                        tags.append("✅ 持仓中")
-                    if i == 0 and stock.get("rs120") is not None:
-                        tags.append("📊 RS120最高")
-                    lp = stock.get("latest_price")
-                    h1 = stock.get("hh20_prev")
-                    rs120 = stock.get("rs120")
-                    market_cap_usd = stock.get("market_cap_usd", stock.get("market_cap"))
-                    market_cap_currency = stock.get("market_cap_currency", "USD")
-                    rows.append({
-                        "标的": stock.get("ticker", ""),
-                        "日期": stock.get("latest_date", "") or "",
-                        "收盘价": f"{lp:.4f}" if isinstance(lp, (int, float)) else "",
-                        "HH20": f"{h1:.4f}" if isinstance(h1, (int, float)) else "",
-                        "RS120": format_rs_pct(rs120) if isinstance(rs120, (int, float)) else "",
-                        "市值(USD)": f"${market_cap_usd/1_000_000_000:.2f}B" if isinstance(market_cap_usd, (int, float)) else "",
-                        "原币种": str(market_cap_currency or ""),
-                        "状态": stock.get("reason", ""),
-                        "标记": " | ".join(tags) if tags else "",
-                    })
-                df_scored = pd.DataFrame(rows)
+                st.caption("📈 候选池排名（Close > 配置EMA 且 20日新高突破，按 RS120 从高到低）")
+                df_scored = pd.DataFrame(decision_view.get("rows", []))
                 row_count = len(df_scored)
                 calc_height = min((row_count * 35) + 37, 500)
-                st.dataframe(df_scored, width="stretch", hide_index=True, height=calc_height)
+                st.dataframe(
+                    df_scored[MOMENTUM_DECISION_COLUMNS],
+                    width="stretch",
+                    hide_index=True,
+                    height=calc_height,
+                    column_config={
+                        "收盘价": st.column_config.NumberColumn(format="%.4f"),
+                        "HH20": st.column_config.NumberColumn(format="%.4f"),
+                        "RS120": st.column_config.NumberColumn(format="%+.2f%%"),
+                        "乖离率": st.column_config.NumberColumn(format="%+.2f%%"),
+                    },
+                )
             
-            # 第三部分：待执行面板
-            st.markdown("##### 【第三部分：待执行】")
-            # 准备待执行操作数据
-            pending_operations = []
-            
-            # 检查是否有待卖出的持仓（支持多持仓）
-            positions = position_audit.get("positions", [])
-            if isinstance(positions, list):
-                for pos in positions:
-                    if pos.get("action_plan") == "待卖出":
-                        pending_operations.append({
-                            "操作": "🔴 卖出",
-                            "标的": pos.get("ticker", ""),
-                            "信号日期": pos.get("latest_date", ""),
-                            "RS120": "",
-                            "原因": pos.get("sell_reason", ""),
-                            "执行时间": "次日开盘"
-                        })
-            else:
-                # 兼容旧的单持仓模式
-                if position_audit.get("action_plan") == "待卖出":
-                    pending_operations.append({
-                        "操作": "🔴 卖出",
-                        "标的": position_audit.get("ticker", ""),
-                        "信号日期": position_audit.get("latest_date", ""),
-                        "RS120": "",
-                        "原因": position_audit.get("sell_reason", ""),
-                        "执行时间": "次日开盘"
-                    })
-            
-            # 检查是否有待买入信号
-            pending_signals = momentum_result.get("pending_buy_signals")
-            if not isinstance(pending_signals, list):
-                pending_signal = momentum_result.get("pending_buy_signal", {})
-                pending_signals = [pending_signal] if pending_signal and pending_signal.get("ticker") else []
-            for pending_signal in pending_signals:
-                pending_operations.append({
-                    "操作": "🟢 买入",
-                    "标的": pending_signal.get("ticker", ""),
-                    "信号日期": pending_signal.get("signal_date", ""),
-                    "RS120": format_rs_pct(pending_signal.get("rs120")) if isinstance(pending_signal.get("rs120"), (int, float)) else "",
-                    "原因": pending_signal.get("reason", ""),
-                    "执行时间": "次日开盘"
-                })
-            
+            st.markdown("##### 【待执行】")
+            pending_operations = build_pending_operations(momentum_result)
             if pending_operations:
                 st.warning("🔒 系统已锁定以下操作，将于次日开盘自动执行")
                 df_pending = pd.DataFrame(pending_operations)
-                # 动态计算高度
                 row_count = len(df_pending)
-                calc_height = (row_count * 35) + 37  # 35px 为行高，40px 为表头留白
-                # 设置高度上限
-                calc_height = min(calc_height, 500)
-                # 应用高度参数，保留use_container_width=True
-                st.dataframe(df_pending, width="stretch", hide_index=True, height=calc_height)
+                calc_height = min((row_count * 35) + 37, 500)
+                st.dataframe(
+                    df_pending[PENDING_OPERATION_COLUMNS],
+                    width="stretch",
+                    hide_index=True,
+                    height=calc_height,
+                )
             else:
                 st.info("当前无待执行操作")
         else:
             st.info("点击 '立即扫描' 按钮以更新个股动量系统数据")
 
-    # ── 执行日志（个股动量 + 大盘/疯牛，独立于动量 UI）────────────────────────
+    # ── 执行日志（个股动量 + 大盘，独立于动量 UI）────────────────────────
     st.divider()
     col_log_title, col_log_btn = st.columns([4, 1])
     with col_log_title:
@@ -1099,7 +918,7 @@ def render_dashboard():
     if st.session_state.get("dialog_open", False):
         trade_dialog()
     st.caption(
-        "汇总个股动量（momentum_state）与大盘/疯牛（position_state）买卖流水；"
+        "汇总个股动量（momentum_state）与大盘（position_state）买卖流水；"
         "调仓记录写入动量状态。"
     )
     execution_logs = load_merged_execution_logs()
@@ -1118,6 +937,13 @@ def render_dashboard():
         _render_execution_logs_table(df_logs, calc_height)
     else:
         st.info("暂无执行日志")
+
+    st.divider()
+    st.markdown("##### 🔗 工具链接")
+    st.markdown(
+        "- [MM US Economic Cycle Clock](https://en.macromicro.me/charts/64/econ-cycle)\n"
+        "- [MM China Economic Cycle Clock](https://en.macromicro.me/charts/328/cn-econ-cycle)"
+    )
 
 
 # 如果直接运行此文件，则渲染仪表盘
